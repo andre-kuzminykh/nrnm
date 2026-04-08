@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html as _html
 import io
 import logging
@@ -894,29 +895,80 @@ def _render_run_summary(run) -> str:
 async def on_task_approve(callback: CallbackQuery):
     """FR-11 approval gate. Prefers the v1.1 LangGraph runtime
     (`run_advanced`) when the session has a StructuredPlan; falls back
-    to the legacy `execute()` for sessions that don't (e.g. when the
-    LLM planner failed and only the legacy stub graph is available)."""
+    to the legacy `execute()` for sessions that don't.
+
+    UX notes:
+    - **ACK immediately** (`callback.answer()` without args) so the
+      Telegram spinner dismisses before the 15-second query timeout.
+      Real runs take 15-30s (LLM planner + SerpAPI + per-step critic
+      + alignment) and without this ACK every tap ends in
+      `TelegramBadRequest: query is too old`.
+    - **Disable the keyboard** right after ACK so the user can't
+      double-tap and spin up a second parallel pipeline (that's twice
+      the OpenAI + SerpAPI bill for the same goal).
+    - **Offload the sync pipeline to a threadpool** via
+      `asyncio.to_thread` so the event loop stays responsive — the
+      /health endpoint, other callbacks, and polling all keep working
+      while the task runs.
+    """
+    await callback.answer()  # dismiss spinner before 15s timeout
+
     session_id = callback.data.split(":", 1)[1]
     try:
         session = modes_svc.get_session(session_id)
     except KeyError:
-        await callback.answer("Сессия не найдена или уже завершена", show_alert=True)
+        await callback.message.answer(
+            "❌ Сессия не найдена или уже завершена",
+            parse_mode=ParseMode.HTML,
+        )
         return
+
+    # Kill the approval keyboard so a second tap doesn't kick off a
+    # duplicate run. Ignored if Telegram already accepted the first
+    # tap's state mutation.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+    status = await callback.message.answer(
+        "⏳ <b>Выполняю план…</b>\n"
+        "<i>Обычно 15–30 секунд: planner → tool calls → per-step critic → goal alignment.</i>",
+        parse_mode=ParseMode.HTML,
+    )
 
     try:
         modes_svc.approve_plan(session_id)
         if session.structured_plan is not None:
-            modes_svc.run_advanced(session_id)
+            # Offload the blocking LLM/HTTP pipeline so the event loop
+            # keeps serving /health and other updates.
+            await asyncio.to_thread(modes_svc.run_advanced, session_id)
             run = session.run
         else:
-            run = modes_svc.execute(session_id)
+            run = await asyncio.to_thread(modes_svc.execute, session_id)
     except modes_svc.ApprovalRequiredError as e:
-        await callback.answer(str(e), show_alert=True)
+        await status.edit_text(
+            f"❌ <i>{_html.escape(str(e))}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("task_approve pipeline failed")
+        await status.edit_text(
+            f"❌ Неожиданная ошибка:\n<code>{_html.escape(str(exc)[:400])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if run is None:
+        await status.edit_text(
+            "❌ Пайплайн не вернул run — проверь логи.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     # FR-17 / FR-22: material replan or goal drift — re-confirm
     if run.state == "awaiting_approval":
-        revised_block = ""
         if run.revised_plan is not None:
             revised_block = (
                 f"<b>Причина:</b> {_html.escape(run.revised_plan.reason)}\n"
@@ -924,49 +976,72 @@ async def on_task_approve(callback: CallbackQuery):
                 f"<pre>{_html.escape(run.revised_plan.human_readable)}</pre>"
             )
         else:
-            # Came from run_advanced -> goal_drift
             reason = (run.result_summary or {}).get("reason", "goal_drift")
             revised_block = (
                 f"<b>Причина:</b> {_html.escape(str(reason))}\n"
                 "Goal alignment просела ниже порога — план надо переделать."
             )
-        await callback.message.answer(
+        await status.edit_text(
             "🔁 <b>План требует пересборки</b>\n\n" + revised_block,
             reply_markup=task_reapproval_keyboard(session_id),
             parse_mode=ParseMode.HTML,
         )
-        await callback.answer("Требуется повторное подтверждение")
         return
 
     icon = "✅" if run.state == "done" else "❌"
-    await callback.message.answer(
+    await status.edit_text(
         f"{icon} <b>Задача завершена</b>\n\n{_render_run_summary(run)}",
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer("Готово")
 
 
 @router.callback_query(F.data.startswith("task_reapprove:"))
 async def on_task_reapprove(callback: CallbackQuery):
-    """FR-17: user confirms the revised plan — resume execution."""
+    """FR-17: user confirms the revised plan — resume execution.
+
+    Same callback-timeout defence as on_task_approve: ACK first,
+    disable the keyboard, show a status, offload the sync work.
+    """
+    await callback.answer()
+
     session_id = callback.data.split(":", 1)[1]
     try:
         session = modes_svc.get_session(session_id)
     except KeyError:
-        await callback.answer("Сессия не найдена", show_alert=True)
+        await callback.message.answer("❌ Сессия не найдена")
         return
-    # Swap the live plan with the revised one and re-arm for execute()
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
+    status = await callback.message.answer(
+        "⏳ <b>Запускаю пересобранный план…</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Swap the live plan with the revised one and re-arm
     if session.run and session.run.revised_plan:
         session.plan.graph = session.run.revised_plan.graph
         session.plan.human_readable = session.run.revised_plan.human_readable
     session.state = "executing"
     session.run = None  # fresh run against the revised graph
-    run = modes_svc.execute(session_id)
-    await callback.message.answer(
+
+    try:
+        run = await asyncio.to_thread(modes_svc.execute, session_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("task_reapprove pipeline failed")
+        await status.edit_text(
+            f"❌ Неожиданная ошибка:\n<code>{_html.escape(str(exc)[:400])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await status.edit_text(
         f"✅ <b>Задача выполнена (revised)</b>\n\n{_render_run_summary(run)}",
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer("Готово")
 
 
 @router.callback_query(F.data.startswith("task_reject:"))

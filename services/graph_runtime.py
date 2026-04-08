@@ -41,6 +41,36 @@ from services.llm_planner import StructuredPlan, PlanStep, ConditionalEdge
 logger = logging.getLogger(__name__)
 
 
+# ── Reducers for LangGraph TypedDict channels ────────────────────
+# Defined at module scope BEFORE `_LGState` so the TypedDict can
+# reference them directly. LangGraph inspects `Annotated` metadata
+# looking for callables; string placeholders are silently ignored
+# and the channel falls back to "single write per step", which then
+# crashes on parallel fan-out.
+
+
+def _dict_merge(left: dict, right: dict) -> dict:
+    """Reducer for `results`. Shallow union; right wins on conflicts.
+    Parallel branches contributing their own step ids never actually
+    conflict because the adapter only emits new keys."""
+    out = dict(left or {})
+    out.update(right or {})
+    return out
+
+
+def _pick_signal(left: str | None, right: str | None) -> str | None:
+    """Reducer for `replan_signal` under parallel writes.
+
+    Semantics: first-set wins. If an earlier parallel branch already
+    flagged `critic_failed` or `goal_drift`, later writes shouldn't
+    clobber it — the replan decision is sticky. None / empty is
+    treated as "no opinion" and never overrides a real signal.
+    """
+    if left:
+        return left
+    return right
+
+
 # ── Public state ─────────────────────────────────────────────────
 
 
@@ -251,12 +281,21 @@ def _execute_step(step: PlanStep, state: GraphState) -> Any:
 
 
 class _LGState(TypedDict, total=False):
-    """LangGraph state schema. Lives at module level so `get_type_hints`
-    can resolve `Annotated` / reducer references during compilation."""
+    """LangGraph state schema. Every field that can be written by more
+    than one parallel branch MUST have a reducer — LangGraph rejects
+    concurrent writes to a non-reduced channel with:
+
+        "At key 'X': Can receive only one value per step.
+         Use an Annotated key to handle multiple values."
+
+    So `results`, `trace`, `completed_step_ids`, AND `replan_signal`
+    all carry reducers. `goal` is read-only after initial state, so
+    it doesn't need one.
+    """
     goal: str
-    results: Annotated[dict, "_dict_merge"]
+    results: Annotated[dict, _dict_merge]
     trace: Annotated[list, operator.add]
-    replan_signal: str
+    replan_signal: Annotated[str, _pick_signal]
     completed_step_ids: Annotated[list, operator.add]
 
 
@@ -268,11 +307,6 @@ def _compile_langgraph(plan: StructuredPlan) -> CompiledPlan:
     `parallel_groups` explicitly — the dependency edges already encode it.
     """
     from langgraph.graph import StateGraph, START, END
-
-    # Replace the placeholder string reducer with the real callable
-    # right before instantiation (LangGraph evaluates it after
-    # get_type_hints during _add_schema).
-    _LGState.__annotations__["results"] = Annotated[dict, _dict_merge]
 
     sg = StateGraph(_LGState)
 
@@ -331,18 +365,16 @@ def _compile_langgraph(plan: StructuredPlan) -> CompiledPlan:
     return CompiledPlan(plan=plan, backend="langgraph", runner=_runner)
 
 
-def _dict_merge(left: dict, right: dict) -> dict:
-    """Reducer for the `results` field — last writer wins on conflicts,
-    union otherwise. Lets parallel branches contribute their step
-    results without clobbering each other."""
-    out = dict(left or {})
-    out.update(right or {})
-    return out
-
-
 def _wrap_for_langgraph(runner: Callable[[GraphState], GraphState]):
     """Adapter: LangGraph passes a TypedDict and expects a dict update;
-    our runner takes/returns a GraphState dataclass. Bridge them."""
+    our runner takes/returns a GraphState dataclass. Bridge them.
+
+    Critical: only include fields that *actually changed*. Writing
+    `replan_signal: None` on every step caused concurrent-write failures
+    under parallel fan-out because LangGraph treats every key in the
+    return dict as a channel write — even if the value didn't really
+    change. Minimal updates = no phantom conflicts.
+    """
     def _adapter(state: dict) -> dict:
         gs = GraphState(
             goal=state.get("goal", ""),
@@ -354,15 +386,30 @@ def _wrap_for_langgraph(runner: Callable[[GraphState], GraphState]):
         prior_trace_len = len(gs.trace)
         prior_completed = set(gs.completed_step_ids)
         runner(gs)
-        # Return only the *delta* so reducers union correctly.
-        return {
-            "results": gs.results,
-            "trace": gs.trace[prior_trace_len:],
-            "replan_signal": gs.replan_signal,
-            "completed_step_ids": [
-                sid for sid in gs.completed_step_ids if sid not in prior_completed
-            ],
+
+        # Only emit the delta — each field is skipped if it has nothing
+        # new to contribute. Reducers then union cleanly across parallel
+        # branches.
+        update: dict = {}
+        new_results = {
+            k: v for k, v in gs.results.items()
+            if (state.get("results") or {}).get(k) is not v
         }
+        if new_results:
+            update["results"] = new_results
+        new_trace = gs.trace[prior_trace_len:]
+        if new_trace:
+            update["trace"] = new_trace
+        new_completed = [
+            sid for sid in gs.completed_step_ids if sid not in prior_completed
+        ]
+        if new_completed:
+            update["completed_step_ids"] = new_completed
+        # Only write replan_signal if we actually set one — never emit
+        # a spurious None update (see _pick_signal docstring).
+        if gs.replan_signal is not None:
+            update["replan_signal"] = gs.replan_signal
+        return update
     return _adapter
 
 
