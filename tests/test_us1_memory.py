@@ -85,6 +85,23 @@ def test_fr_3_first_save_creates_version_v1(platform_svc, tg_id):
     assert obj.memory_object_id
 
 
+def test_fr_3_rule6_update_creates_new_version_preserving_old(platform_svc, tg_id):
+    """FR-3 + Rule 6: обновление объекта должно создавать новую версию,
+    при этом старая версия обязана остаться доступной (`list_versions`
+    возвращает обе). Эта инвариантность — ключ к NFR-5 и к метрике
+    «100% файлов в Памяти имеют version history»."""
+    if not hasattr(platform_svc, "create_memory_object"):
+        pytest.skip("TODO FR-3 / Rule 6: version-preserving update not implemented")
+    obj = platform_svc.create_memory_object(tg_id, kind="note", content="v1-body")  # type: ignore[attr-defined]
+    platform_svc.update_memory_object(obj.memory_object_id, content="v2-body")  # type: ignore[attr-defined]
+
+    versions = platform_svc.list_versions(obj.memory_object_id)  # type: ignore[attr-defined]
+    assert [v.version for v in versions] == ["v1", "v2"]
+    # Старая версия должна быть читаема после апдейта.
+    v1 = platform_svc.read_memory_object(obj.memory_object_id, version="v1")  # type: ignore[attr-defined]
+    assert v1.content == "v1-body"
+
+
 # ─────────────────────────────────────────────────────────────────
 # FR-4 — явное подключение объектов через `[контекст]`
 # ─────────────────────────────────────────────────────────────────

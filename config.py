@@ -34,3 +34,8 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+
+# ── Health server ────────────────────────────────────────────────
+# Lightweight aiohttp endpoint for Docker / GCE healthchecks.
+# GET /health → 200 {"status": "ok", "service": "nrnm-platform-bot"}
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8003"))

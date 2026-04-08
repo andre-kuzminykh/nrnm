@@ -155,6 +155,21 @@ ingestятся без ошибок.
 | `QDRANT_API_KEY` | | `""` | — |
 | `EMBEDDING_MODEL` | | `text-embedding-3-small` | OpenAI embedding модель |
 | `EMBEDDING_DIM` | | `1536` | Размерность эмбеддинга (3-small = 1536) |
+| `HEALTH_PORT` | | `8003` | Порт для `GET /health` (docker-compose healthcheck, GCE probes) |
+
+### Health endpoint
+
+Бот поднимает aiohttp-сервер на `HEALTH_PORT` (по умолчанию 8003) — это
+нужно, чтобы docker-compose healthcheck и внешние probe'ы понимали, что
+процесс жив.
+
+```bash
+curl http://localhost:8003/health
+# {"status": "ok", "service": "nrnm-platform-bot"}
+```
+
+Порт пробрасывается из `.env` в docker-compose (`${HEALTH_PORT:-8003}`),
+так что достаточно поменять значение в `.env` и перезапустить сервис.
 
 ## Кастомизация
 

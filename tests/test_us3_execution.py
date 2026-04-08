@@ -123,8 +123,9 @@ def test_fr_15_every_planned_stage_has_expected_result(platform_svc, tg_id):
 # ─────────────────────────────────────────────────────────────────
 
 def test_fr_16_failed_stage_triggers_replanning(platform_svc, tg_id):
-    """FR-16: если stage не прошёл verification, должен сработать
-    replanning engine и выдать revised plan."""
+    """FR-16 (Rule 5 trigger #1+#2): если stage не прошёл verification /
+    acceptance criteria, должен сработать replanning engine и выдать
+    revised plan."""
     modes = _modes_api()
     if modes is None:
         pytest.skip("TODO FR-16: Replanning engine not implemented")
@@ -132,6 +133,62 @@ def test_fr_16_failed_stage_triggers_replanning(platform_svc, tg_id):
     modes.approve_plan(session.id)  # type: ignore[attr-defined]
     run = modes.execute(session.id, inject_failure_on="stage-1")  # type: ignore[attr-defined]
     assert run.revised_plan is not None, "replan must produce a revised plan"
+
+
+def test_fr_16_tool_failure_triggers_replanning(platform_svc, tg_id):
+    """FR-16 (Rule 5 trigger #3): tool failure, блокирующий прогресс,
+    должен инициировать replanning."""
+    modes = _modes_api()
+    if modes is None:
+        pytest.skip("TODO FR-16: tool-failure replan not implemented")
+    session = modes.start_task(tg_id, goal="use-web-search")  # type: ignore[attr-defined]
+    modes.approve_plan(session.id)  # type: ignore[attr-defined]
+    run = modes.execute(session.id, inject_tool_failure="web_search")  # type: ignore[attr-defined]
+    assert run.revised_plan is not None
+    assert run.revised_plan.reason == "tool_failure"
+
+
+def test_fr_16_missing_input_triggers_replanning(platform_svc, tg_id):
+    """FR-16 (Rule 5 trigger #4): отсутствие обязательного input у stage
+    должно запускать replanning."""
+    modes = _modes_api()
+    if modes is None:
+        pytest.skip("TODO FR-16: missing-input replan not implemented")
+    session = modes.start_task(tg_id, goal="requires-missing-input")  # type: ignore[attr-defined]
+    modes.approve_plan(session.id)  # type: ignore[attr-defined]
+    run = modes.execute(session.id, inject_missing_input_on="stage-2")  # type: ignore[attr-defined]
+    assert run.revised_plan is not None
+    assert run.revised_plan.reason == "missing_input"
+
+
+def test_fr_16_user_constraint_change_triggers_replanning(platform_svc, tg_id):
+    """FR-16 (Rule 5 trigger #5): изменение constraints пользователем во
+    время исполнения должно инициировать replanning."""
+    modes = _modes_api()
+    if modes is None:
+        pytest.skip("TODO FR-16: user-constraint replan not implemented")
+    session = modes.start_task(tg_id, goal="long-running")  # type: ignore[attr-defined]
+    modes.approve_plan(session.id)  # type: ignore[attr-defined]
+    modes.begin_execution(session.id)  # type: ignore[attr-defined]
+    run = modes.update_constraints(  # type: ignore[attr-defined]
+        session.id, constraints={"max_steps": 2},
+    )
+    assert run.revised_plan is not None
+    assert run.revised_plan.reason == "constraints_changed"
+
+
+def test_fr_16_rule5_no_replan_without_deviation(platform_svc, tg_id):
+    """Rule 5 negative: если никаких из 5 триггеров не произошло —
+    replanning engine не должен вообще активироваться, run завершается
+    по исходному approved graph."""
+    modes = _modes_api()
+    if modes is None:
+        pytest.skip("TODO Rule 5: negative replan path not implemented")
+    session = modes.start_task(tg_id, goal="happy-path")  # type: ignore[attr-defined]
+    modes.approve_plan(session.id)  # type: ignore[attr-defined]
+    run = modes.execute(session.id)  # type: ignore[attr-defined]
+    assert run.revised_plan is None
+    assert run.state == "done"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -206,3 +263,37 @@ def test_nfr_11_replan_preserves_already_valid_stages(platform_svc, tg_id):
     replanned = {n.id for n in run.revised_plan.graph.nodes if n.state == "pending"}
     assert "stage-1" in preserved
     assert "stage-1" not in replanned
+
+
+# ─────────────────────────────────────────────────────────────────
+# NFR-12 — every task run has plan preview + execution trace + result summary
+# ─────────────────────────────────────────────────────────────────
+
+def test_nfr_12_task_run_has_plan_preview_trace_and_summary(platform_svc, tg_id):
+    """NFR-12 (из метрики §1): каждый task run должен содержать все три
+    артефакта — plan preview, execution trace и result summary. Это
+    100%-инвариант: даже упавший или отменённый run должен их иметь."""
+    modes = _modes_api()
+    if modes is None:
+        pytest.skip("TODO NFR-12: task run artefacts not implemented")
+    session = modes.start_task(tg_id, goal="produce-any-result")  # type: ignore[attr-defined]
+    modes.approve_plan(session.id)  # type: ignore[attr-defined]
+    run = modes.execute(session.id)  # type: ignore[attr-defined]
+
+    assert run.plan_preview, "NFR-12: plan_preview missing from task run"
+    assert run.execution_trace is not None, "NFR-12: execution_trace missing"
+    assert run.result_summary is not None, "NFR-12: result_summary missing"
+
+
+def test_nfr_12_failed_run_still_has_artefacts(platform_svc, tg_id):
+    """NFR-12: даже если run упал — артефакты обязаны быть. Мы не хотим
+    невидимых «фантомных» runs."""
+    modes = _modes_api()
+    if modes is None:
+        pytest.skip("TODO NFR-12: task run artefacts not implemented")
+    session = modes.start_task(tg_id, goal="will-fail")  # type: ignore[attr-defined]
+    modes.approve_plan(session.id)  # type: ignore[attr-defined]
+    run = modes.execute(session.id, inject_failure_on="stage-1")  # type: ignore[attr-defined]
+    assert run.plan_preview
+    assert run.execution_trace is not None
+    assert run.result_summary is not None
