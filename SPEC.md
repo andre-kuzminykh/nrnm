@@ -299,7 +299,11 @@ Telegram input
 * Vector index (Memory retrieval)
 * Redis (session state, queues)
 * LLM provider
-* Web Search integration
+* Web Search integration — SerpAPI (`SERPAPI_API_KEY`). В v1 это
+  единственный провайдер; при отсутствии ключа tool graceful-fallback'ает
+  на детерминированный stub так, чтобы executor-pipeline оставался
+  проходимым в offline dev / CI. HTTP-ошибки SerpAPI маппятся в
+  `status="error"` и триггерят replan (FR-16, Rule 5 trigger #3).
 * PDF Parser service
 * Logging / tracing stack
 

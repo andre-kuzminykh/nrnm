@@ -18,8 +18,13 @@ a concrete tool implementation directly — it always goes through
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+import config
+
+logger = logging.getLogger(__name__)
 
 
 class DisallowedToolError(RuntimeError):
@@ -35,25 +40,107 @@ class ToolCallResult:
     metadata: dict = field(default_factory=dict)
 
 
-# ── Registry ─────────────────────────────────────────────────────
+# ── web_search: SerpAPI provider with stub fallback ─────────────
 
-def _web_search(query: str, **_: Any) -> ToolCallResult:
-    """Stub web search — returns a deterministic "ok" result with a fake
-    hit list so the executor + verification pipeline can run end-to-end
-    without hitting the network. Swap for a real SerpAPI/Brave client
-    when ready."""
-    if not query:
-        return ToolCallResult(status="error", error="empty query")
+def _web_search_stub(query: str) -> ToolCallResult:
+    """Deterministic fake hits — used in tests, offline dev, or when
+    SERPAPI_API_KEY is not configured. Keeps the executor pipeline
+    exercisable without hitting the network."""
     return ToolCallResult(
         status="ok",
         output={
             "hits": [
-                {"title": f"Result for {query}", "url": "https://example.com/1"},
-                {"title": f"Secondary {query}", "url": "https://example.com/2"},
+                {"title": f"Result for {query}", "url": "https://example.com/1", "snippet": ""},
+                {"title": f"Secondary {query}", "url": "https://example.com/2", "snippet": ""},
             ],
         },
-        metadata={"tool": "web_search", "query": query},
+        metadata={"tool": "web_search", "provider": "stub", "query": query},
     )
+
+
+def _web_search_serpapi(query: str, num: int = 5) -> ToolCallResult:
+    """Real SerpAPI call. Returns a normalised `hits` list so callers
+    don't have to care whether the underlying provider is SerpAPI,
+    Brave, or the stub.
+
+    Uses sync `httpx.Client` because the executor loop in
+    `services.modes.execute` is synchronous. Any network error
+    degrades into a `status="error"` ToolCallResult — the executor
+    interprets that as a Rule-5 tool_failure trigger (FR-16) and the
+    replanning engine takes over.
+    """
+    try:
+        import httpx  # transitive dep via openai / aiogram
+    except Exception as exc:  # noqa: BLE001
+        return ToolCallResult(
+            status="error", error=f"httpx unavailable: {exc}",
+            metadata={"tool": "web_search", "provider": "serpapi"},
+        )
+
+    params = {
+        "engine": config.SERPAPI_ENGINE,
+        "q": query,
+        "api_key": config.SERPAPI_API_KEY,
+        "num": num,
+    }
+    try:
+        with httpx.Client(timeout=config.SERPAPI_TIMEOUT) as client:
+            resp = client.get(config.SERPAPI_ENDPOINT, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as exc:
+        logger.warning("SerpAPI HTTP error: %s", exc)
+        return ToolCallResult(
+            status="error", error=f"serpapi http: {exc}",
+            metadata={"tool": "web_search", "provider": "serpapi", "query": query},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SerpAPI unexpected: %s", exc)
+        return ToolCallResult(
+            status="error", error=f"serpapi: {exc}",
+            metadata={"tool": "web_search", "provider": "serpapi", "query": query},
+        )
+
+    hits = []
+    for item in (data.get("organic_results") or [])[:num]:
+        hits.append({
+            "title": item.get("title", ""),
+            "url": item.get("link", ""),
+            "snippet": item.get("snippet", ""),
+        })
+    # Answer box is often the most useful piece — inject it as hit 0
+    # with a clear "answer_box" source marker.
+    ab = data.get("answer_box")
+    if ab:
+        hits.insert(0, {
+            "title": ab.get("title", "answer_box"),
+            "url": ab.get("link", ""),
+            "snippet": ab.get("answer") or ab.get("snippet") or "",
+        })
+
+    return ToolCallResult(
+        status="ok",
+        output={"hits": hits},
+        metadata={
+            "tool": "web_search",
+            "provider": "serpapi",
+            "query": query,
+            "engine": config.SERPAPI_ENGINE,
+        },
+    )
+
+
+def _web_search(query: str, **_: Any) -> ToolCallResult:
+    """v1 web_search entry point. Routes to SerpAPI when configured,
+    falls back to the stub otherwise. Empty query is a hard error."""
+    if not query:
+        return ToolCallResult(
+            status="error", error="empty query",
+            metadata={"tool": "web_search"},
+        )
+    if config.SERPAPI_API_KEY:
+        return _web_search_serpapi(query)
+    return _web_search_stub(query)
 
 
 def _pdf_parser(content: str | bytes = "", **_: Any) -> ToolCallResult:
