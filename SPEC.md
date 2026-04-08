@@ -228,6 +228,11 @@ Functional Requirements
 | FR-20 | Executor должен компилировать план в граф LangGraph и запускать его (parallel + sequential + conditional)                                            |
 | FR-21 | После каждого шага запускается LLM-критик: верификация результата против expected_result, бинарный verdict pass/fail с обоснованием                  |
 | FR-22 | После каждого шага запускается goal-alignment проверка: drift от исходной цели, при превышении порога — триггер replan/redesign                      |
+| FR-23 | Инструменты регистрируются как MCP-записи: `{name, url, token, description, created_at, updated_at}`. Запись можно добавлять, редактировать, удалять |
+| FR-24 | Каждый домен ведёт собственный MCP-реестр. При создании нового домена автоматически бутстрапится дефолтный `web_search` (builtin://serpapi)         |
+| FR-25 | LLM-планировщик получает описания MCP активного домена и использует их как available_tools для привязки шагов                                         |
+| FR-26 | Tool invocation идёт через `services/mcp_client.py`: `builtin://*` → в-процессная реализация, `http(s)://*` → POST на MCP-сервер с bearer token      |
+| FR-27 | RAG-ответ показывает источники как tap-to-original через Telegram `reply_to_message_id`. Никаких `[N]` маркеров, никакого `Источники:` footer          |
 
 Non-Functional Requirements
 
@@ -237,6 +242,7 @@ Non-Functional Requirements
 | NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными                                                                               |
 | NFR-12 | Каждый task run в режиме Задачи должен содержать `plan_preview`, `execution_trace` и `result_summary` (100%)                                                             |
 | NFR-14 | LLM-компоненты (planner, critic, alignment) должны иметь deterministic stub fallback на случай отсутствия API-ключа / langgraph — для offline dev и CI                   |
+| NFR-15 | Ошибки MCP-клиента (HTTP / network / невалидный response) должны деградировать в `ToolCallResult(status="error")` и триггерить Rule-5 tool_failure replan (FR-16)          |
 
 ---
 
@@ -425,6 +431,12 @@ Graph re-evaluation запускается только если:
 | FR-21  | `tests/test_us4_advanced_planner.py` |
 | FR-22  | `tests/test_us4_advanced_planner.py` |
 | NFR-14 | `tests/test_us4_advanced_planner.py` |
+| FR-23  | `tests/test_us5_mcp.py`              |
+| FR-24  | `tests/test_us5_mcp.py`              |
+| FR-25  | `tests/test_us5_mcp.py`              |
+| FR-26  | `tests/test_us5_mcp.py`              |
+| FR-27  | `tests/test_us5_mcp.py`              |
+| NFR-15 | `tests/test_us5_mcp.py`              |
 
 > На момент фиксации v1-спеки многие поведения ещё не реализованы в коде (`services/platform.py` описывает legacy domain-based API из FR-P1..P19). Тесты под ещё не реализованные требования помечены `pytest.skip(...)` с явным `TODO` — они образуют spec-driven roadmap и активируются по мере реализации соответствующих модулей.
 
