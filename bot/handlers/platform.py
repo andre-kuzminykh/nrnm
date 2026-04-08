@@ -652,13 +652,14 @@ async def _handle_rag_chat(message: Message) -> None:
         await status.edit_text("❌ В выбранных доменах ничего релевантного не нашёл.")
         return
 
-    # FR-P18: build numbered source list deduped by filename so each unique
-    # source gets a single [N] marker. Each chunk references its file's number,
-    # which the LLM is instructed to use inline.
-    sources, chunk_to_idx = _build_sources(top) if top else ([], [])
+    # FR-27: drop numbered [N] citations entirely. Keep a deduped source
+    # list purely to pick the reply target (so Telegram's quote-preview
+    # still jumps to the original file on tap) and to bold filenames if
+    # the LLM mentions them inline.
+    sources = _dedupe_sources(top) if top else []
     rag_context = "\n\n---\n\n".join(
-        f"[{chunk_to_idx[i]}] ({h['filename']}): {h['text']}"
-        for i, h in enumerate(top)
+        f"(файл: {h['filename']})\n{h['text']}"
+        for h in top
     )
 
     # Merge the explicit full-file block (FR-5) with the top-k RAG excerpts.
@@ -675,11 +676,12 @@ async def _handle_rag_chat(message: Message) -> None:
         "role": "system",
         "content": (
             "Ты — помощник, отвечающий на основе контекста из базы знаний пользователя. "
-            "Если в контексте есть секция [ПОЛНЫЙ ФАЙЛ] или [СВОД], это явно подключённый "
-            "пользователем файл — используй его как основной источник. "
-            "Фрагменты вида [1], [2] — это top-k поиск; ставь их номер в квадратных "
-            "скобках сразу после утверждения, использующего этот фрагмент, например: "
-            "«Apollo 11 высадился на Луне в 1969 году [2].» "
+            "Если в контексте есть секция [ПОЛНЫЙ ФАЙЛ] или [СВОД] — это явно подключённый "
+            "пользователем файл, используй его как основной источник. "
+            "Если ссылаешься на файл, просто упомяни его название в обычном предложении, "
+            "например «в файле report.pdf сказано, что…». "
+            "НИКОГДА не ставь маркеры вида [1], [2] — номера источников не нужны, "
+            "пользователь попадёт в оригинал через quote-preview Telegram. "
             "Если в контексте нет ответа — так и скажи, не выдумывай."
         ),
     }]
@@ -701,18 +703,17 @@ async def _handle_rag_chat(message: Message) -> None:
         return
 
     platform_svc.add_chat_message(tg_id, "assistant", answer)
-    answer_html = _format_answer_with_citations(answer, sources)
-    sources_html = _render_sources_footer(sources)
+    answer_html = _render_answer_with_inline_sources(
+        answer, [s["filename"] for s in sources],
+    )
     final_text = (
-        f"💬 <b>{_html.escape(_model_label(user.model_id))}</b> "
-        f"<i>(домены: {_html.escape(', '.join(active))})</i>\n\n"
-        f"{answer_html}\n\n"
-        f"<b>Источники:</b>\n{sources_html}"
+        f"💬 <b>{_html.escape(_model_label(user.model_id))}</b>\n\n"
+        f"{answer_html}"
     )
 
-    # FR-P18: send the answer as a reply to the top source's upload message
-    # so users can tap the quoted preview to jump straight to the source file.
-    # Drop the «⏳ Ищу в памяти…» status message since the answer replaces it.
+    # FR-27: reply to the top source's upload message — the quote-preview
+    # IS the hyperlink. Tap the quoted filename → jump to the original.
+    # No numbered citations, no footer — just the answer + reply anchor.
     reply_to = next((s["message_id"] for s in sources if s["message_id"]), None)
     try:
         await message.bot.send_message(
@@ -739,73 +740,55 @@ async def _handle_rag_chat(message: Message) -> None:
         pass
 
 
-# ── FR-P18: source citation helpers ──────────────────────────────
+# ── FR-27: RAG source rendering (no numbers, no footer) ─────────
 
-def _build_sources(top: list[dict]) -> tuple[list[dict], list[int]]:
-    """Dedupe top hits by filename. Returns:
-       * `sources`  — ordered list of `{idx, filename, message_id, domain}`,
-                      one per unique filename, idx is 1-based.
-       * `chunk_to_idx` — list parallel to `top`, mapping each chunk to its
-                          source idx so the LLM context can prefix each
-                          fragment with its citation number.
-    """
-    sources: list[dict] = []
-    seen: dict[str, int] = {}
-    chunk_to_idx: list[int] = []
+def _dedupe_sources(top: list[dict]) -> list[dict]:
+    """Dedupe RAG hits by filename in score order. Returns an ordered
+    list of `{filename, message_id, domain}` — no idx number anymore.
+    First entry is the primary source (reply target)."""
+    out: list[dict] = []
+    seen: set[str] = set()
     for h in top:
         fn = h.get("filename") or "(без имени)"
-        if fn not in seen:
-            seen[fn] = len(sources) + 1
-            sources.append({
-                "idx": seen[fn],
-                "filename": fn,
-                "message_id": h.get("message_id"),
-                "domain": h.get("domain", ""),
-            })
-        chunk_to_idx.append(seen[fn])
-    return sources, chunk_to_idx
+        if fn in seen:
+            continue
+        seen.add(fn)
+        out.append({
+            "filename": fn,
+            "message_id": h.get("message_id"),
+            "domain": h.get("domain", ""),
+        })
+    return out
 
 
-def _render_sources_footer(sources: list[dict]) -> str:
-    """Render the «Источники» list as `[N] 📎 filename` lines.
-    Filenames are wrapped in `<code>` for visual distinction. The clickable
-    deep-link is provided by `reply_to_message_id` on the answer message
-    itself (Telegram's native quote-preview), since custom `tg://` href
-    schemes are not whitelisted by Bot API HTML mode."""
-    lines: list[str] = []
-    for s in sources:
-        fn = _html.escape(s["filename"])
-        lines.append(f"[{s['idx']}] 📎 <code>{fn}</code>")
-    return "\n".join(lines)
+def _render_answer_with_inline_sources(answer: str, filenames: list[str]) -> str:
+    """HTML-escape the answer and bold any filename mentions so the user
+    visually spots them. No numbered markers, no footer — the tappable
+    quote-preview at the top of the message (via `reply_to_message_id`)
+    IS the navigation affordance.
 
-
-def _format_answer_with_citations(answer: str, sources: list[dict]) -> str:
-    """FR-P19: HTML-escape the LLM answer, **bold** every `[N]` citation, and
-    if the model forgot to cite anything, append a tail like
-    «(Источники: [1], [2])» referencing every available source so the link
-    between the answer and the source list is preserved."""
+    If the model accidentally slips a `[1]` or `[2]` marker back in
+    despite the system prompt, strip it so the UX stays clean.
+    """
     import re
 
-    escaped = _html.escape(answer)
-    # Find all valid [N] markers (where N matches a known source idx)
-    valid_idxs = {s["idx"] for s in sources}
-    found: set[int] = set()
+    text = _html.escape(answer)
 
-    def repl(m: "re.Match[str]") -> str:
-        n = int(m.group(1))
-        if n in valid_idxs:
-            found.add(n)
-            return f"<b>[{n}]</b>"
-        return m.group(0)  # leave [N] alone if it doesn't match a real source
+    # Strip any stray [N] markers the model might have produced.
+    text = re.sub(r"\s*\[\d+\]", "", text)
 
-    bolded = re.sub(r"\[(\d+)\]", repl, escaped)
-
-    if not found and sources:
-        # Model forgot to cite — append a fallback tail referencing all sources
-        tail = ", ".join(f"<b>[{s['idx']}]</b>" for s in sources)
-        bolded = f"{bolded}\n\n<i>(Источники: {tail})</i>"
-
-    return bolded
+    # Bold every literal occurrence of a known filename so it stands out.
+    # Sort by length descending so "report-final.pdf" bolds before "report".
+    for fn in sorted(set(filenames), key=len, reverse=True):
+        if not fn:
+            continue
+        esc_fn = re.escape(_html.escape(fn))
+        text = re.sub(
+            rf"(?<!<b>){esc_fn}(?!</b>)",
+            f"<b>{_html.escape(fn)}</b>",
+            text,
+        )
+    return text
 
 
 def _extract_text(data: bytes, filename: str) -> str:
