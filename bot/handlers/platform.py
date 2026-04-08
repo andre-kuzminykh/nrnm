@@ -37,6 +37,7 @@ from services import rag
 from services import modes as modes_svc
 from services import context_resolver
 from services import memory as memory_svc
+from services import mcp_registry
 from bot.keyboards.inline import (
     platform_menu_keyboard,
     platform_model_keyboard,
@@ -45,6 +46,9 @@ from bot.keyboards.inline import (
     platform_domain_keyboard,
     platform_doc_keyboard,
     platform_answer_keyboard,
+    platform_mcp_list_keyboard,
+    platform_mcp_view_keyboard,
+    platform_mcp_cancel_keyboard,
     task_approval_keyboard,
     task_reapproval_keyboard,
 )
@@ -304,17 +308,19 @@ async def on_platform_domain_open(callback: CallbackQuery):
     _set_wait(tg_id, "platform")
     domain = doms[idx]
     is_active = domain.name in user.active_domains
+    mcp_count = len(getattr(domain, "mcps", None) or [])
     text = (
         f"📁 <b>Домен:</b> {_html.escape(domain.name)}\n"
         f"<b>Документов:</b> {len(domain.documents)}\n"
+        f"<b>Инструментов (MCP):</b> {mcp_count}\n"
         f"<b>Выбран для RAG:</b> {'да' if is_active else 'нет'}\n\n"
         "<i>📎 Чтобы добавить файлы — отправьте их прямо в чат "
-        "(txt/md/pdf/docx). Они автоматически попадут в этот домен "
-        "(после нажатия «Выбрать для RAG»).</i>"
+        "(txt/md/pdf/docx). Они автоматически попадут в этот домен.\n"
+        "🔧 MCP-инструменты — доступны Task mode планировщику для данного домена.</i>"
     )
     await _replace_widget(
         callback.message, text,
-        reply_markup=platform_domain_keyboard(idx, domain.documents, is_active),
+        reply_markup=platform_domain_keyboard(idx, domain.documents, is_active, mcp_count),
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
@@ -383,6 +389,267 @@ async def on_platform_doc_delete(callback: CallbackQuery):
     platform_svc.delete_document(tg_id, domain.name, doc.doc_id)
     await callback.answer("Удалено")
     await on_platform_domain_open(callback)
+
+
+# ── FR-23/24: MCP management ────────────────────────────────────
+
+def _mcp_wait_key(tg_id: int) -> str:
+    """Key used in _PLATFORM_WAIT to stash the in-progress MCP FSM
+    payload. We piggyback on the existing wait-state dict rather than
+    adding a second FSM — the lifecycle is short and single-step per
+    user so one slot is enough."""
+    return f"mcp:{tg_id}"
+
+
+_MCP_DRAFT: dict[int, dict] = {}
+
+
+@router.callback_query(F.data.startswith("platform_mcp_list:"))
+async def on_platform_mcp_list(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    idx = int(callback.data.split(":", 1)[1])
+    user = platform_svc.get_user(tg_id)
+    doms = list(user.domains.values())
+    if idx >= len(doms):
+        await callback.answer("Домен не найден", show_alert=True)
+        return
+    domain = doms[idx]
+    mcps = mcp_registry.list_mcps(tg_id, domain.name)
+    text = (
+        f"🔧 <b>Инструменты домена «{_html.escape(domain.name)}»</b>\n\n"
+        f"<i>Task-режим видит эти MCP как available tools. "
+        f"По умолчанию есть web_search (SerpAPI). Можно добавить свои HTTP-MCP.</i>"
+    )
+    if not mcps:
+        text += "\n\n<i>Инструментов нет. Нажмите ➕ чтобы добавить.</i>"
+    await _replace_widget(
+        callback.message, text,
+        reply_markup=platform_mcp_list_keyboard(idx, mcps),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("platform_mcp_view:"))
+async def on_platform_mcp_view(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    _, dom_idx_s, mcp_idx_s = callback.data.split(":", 2)
+    dom_idx = int(dom_idx_s)
+    mcp_idx = int(mcp_idx_s)
+    user = platform_svc.get_user(tg_id)
+    doms = list(user.domains.values())
+    if dom_idx >= len(doms):
+        await callback.answer("Домен не найден")
+        return
+    mcps = mcp_registry.list_mcps(tg_id, doms[dom_idx].name)
+    if mcp_idx >= len(mcps):
+        await callback.answer("MCP не найден")
+        return
+    mcp = mcps[mcp_idx]
+    kind = "builtin" if mcp.is_builtin else "http"
+    text = (
+        f"🔧 <b>{_html.escape(mcp.name)}</b>\n\n"
+        f"<b>Тип:</b> {kind}\n"
+        f"<b>URL:</b> <code>{_html.escape(mcp.url)}</code>\n"
+        f"<b>Token:</b> <code>{'***' if mcp.token else '(нет)'}</code>\n"
+        f"<b>Описание:</b>\n<i>{_html.escape(mcp.description or '—')}</i>\n\n"
+        f"<b>Создан:</b> {mcp.created_at}\n"
+        f"<b>Обновлён:</b> {mcp.updated_at}"
+    )
+    await _replace_widget(
+        callback.message, text,
+        reply_markup=platform_mcp_view_keyboard(dom_idx, mcp_idx),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("platform_mcp_delete:"))
+async def on_platform_mcp_delete(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    _, dom_idx_s, mcp_idx_s = callback.data.split(":", 2)
+    dom_idx = int(dom_idx_s)
+    mcp_idx = int(mcp_idx_s)
+    user = platform_svc.get_user(tg_id)
+    doms = list(user.domains.values())
+    if dom_idx >= len(doms):
+        await callback.answer("Домен не найден")
+        return
+    mcps = mcp_registry.list_mcps(tg_id, doms[dom_idx].name)
+    if mcp_idx >= len(mcps):
+        await callback.answer("MCP не найден")
+        return
+    name = mcps[mcp_idx].name
+    mcp_registry.delete_mcp(tg_id, doms[dom_idx].name, name)
+    await callback.answer(f"Удалён: {name}")
+    # Rebuild as a new MCP list-callback — fake the new callback_data
+    callback.data = f"platform_mcp_list:{dom_idx}"
+    await on_platform_mcp_list(callback)
+
+
+@router.callback_query(F.data.startswith("platform_mcp_new:"))
+async def on_platform_mcp_new(callback: CallbackQuery):
+    """Start the add-MCP FSM: first ask for name."""
+    tg_id = callback.from_user.id
+    dom_idx = int(callback.data.split(":", 1)[1])
+    user = platform_svc.get_user(tg_id)
+    doms = list(user.domains.values())
+    if dom_idx >= len(doms):
+        await callback.answer("Домен не найден")
+        return
+    _MCP_DRAFT[tg_id] = {"domain_idx": dom_idx, "stage": "name"}
+    _set_wait(tg_id, _mcp_wait_key(tg_id))
+    await _replace_widget(
+        callback.message,
+        "🔧 <b>Новый MCP</b>\n\n"
+        "<b>Шаг 1/4 — Имя:</b>\n"
+        "Отправьте короткое имя инструмента (англ. буквы, цифры, _ -). "
+        "Например: <code>github_search</code>, <code>slack_notify</code>.",
+        reply_markup=platform_mcp_cancel_keyboard(dom_idx),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("platform_mcp_edit:"))
+async def on_platform_mcp_edit(callback: CallbackQuery):
+    """Start the edit-MCP FSM: pre-load the existing entry and ask
+    for a new description first (most common edit). URL/token stay
+    as-is unless the user sends `-` to reuse the current value."""
+    tg_id = callback.from_user.id
+    _, dom_idx_s, mcp_idx_s = callback.data.split(":", 2)
+    dom_idx = int(dom_idx_s)
+    mcp_idx = int(mcp_idx_s)
+    user = platform_svc.get_user(tg_id)
+    doms = list(user.domains.values())
+    if dom_idx >= len(doms):
+        await callback.answer("Домен не найден")
+        return
+    mcps = mcp_registry.list_mcps(tg_id, doms[dom_idx].name)
+    if mcp_idx >= len(mcps):
+        await callback.answer("MCP не найден")
+        return
+    existing = mcps[mcp_idx]
+    _MCP_DRAFT[tg_id] = {
+        "domain_idx": dom_idx,
+        "stage": "edit_description",
+        "edit_name": existing.name,
+    }
+    _set_wait(tg_id, _mcp_wait_key(tg_id))
+    await _replace_widget(
+        callback.message,
+        f"✏️ <b>Редактирование MCP «{_html.escape(existing.name)}»</b>\n\n"
+        f"Отправьте новое описание (или <code>-</code> чтобы оставить как есть).\n\n"
+        f"<b>Текущее:</b>\n<i>{_html.escape(existing.description or '—')}</i>",
+        reply_markup=platform_mcp_cancel_keyboard(dom_idx),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+async def _handle_mcp_fsm(message: Message) -> bool:
+    """Text handler for the MCP add/edit FSM. Returns True if handled."""
+    tg_id = message.from_user.id
+    draft = _MCP_DRAFT.get(tg_id)
+    if not draft:
+        return False
+    text = (message.text or "").strip()
+    stage = draft.get("stage")
+    dom_idx = draft["domain_idx"]
+    user = platform_svc.get_user(tg_id)
+    doms = list(user.domains.values())
+    if dom_idx >= len(doms):
+        _MCP_DRAFT.pop(tg_id, None)
+        _set_wait(tg_id, "platform")
+        return False
+    domain_name = doms[dom_idx].name
+
+    # ── Add flow ──────────────────────────────────────────────
+    if stage == "name":
+        draft["name"] = text
+        draft["stage"] = "url"
+        await message.answer(
+            "<b>Шаг 2/4 — URL:</b>\n"
+            "Введите URL MCP-сервера. Для встроенного web_search — "
+            "<code>builtin://serpapi</code>. Для внешнего — "
+            "<code>https://...</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=platform_mcp_cancel_keyboard(dom_idx),
+        )
+        return True
+
+    if stage == "url":
+        draft["url"] = text
+        draft["stage"] = "token"
+        await message.answer(
+            "<b>Шаг 3/4 — Token:</b>\n"
+            "Bearer-токен для авторизации на MCP-сервере. "
+            "Отправьте <code>-</code> если токен не нужен.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=platform_mcp_cancel_keyboard(dom_idx),
+        )
+        return True
+
+    if stage == "token":
+        draft["token"] = "" if text == "-" else text
+        draft["stage"] = "description"
+        await message.answer(
+            "<b>Шаг 4/4 — Описание:</b>\n"
+            "Короткое описание того, что делает инструмент. "
+            "LLM-планировщик читает это и решает, когда его вызывать.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=platform_mcp_cancel_keyboard(dom_idx),
+        )
+        return True
+
+    if stage == "description":
+        try:
+            entry = mcp_registry.add_mcp(
+                tg_id, domain_name,
+                name=draft["name"],
+                url=draft["url"],
+                token=draft.get("token", ""),
+                description=text,
+            )
+        except mcp_registry.MCPRegistryError as exc:
+            await message.answer(
+                f"❌ {_html.escape(str(exc))}\nПопробуйте снова: отправьте имя или нажмите Отмена.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=platform_mcp_cancel_keyboard(dom_idx),
+            )
+            draft["stage"] = "name"
+            return True
+        _MCP_DRAFT.pop(tg_id, None)
+        _set_wait(tg_id, "platform")
+        await message.answer(
+            f"✅ MCP <b>{_html.escape(entry.name)}</b> добавлен в домен "
+            f"<b>{_html.escape(domain_name)}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    # ── Edit flow ─────────────────────────────────────────────
+    if stage == "edit_description":
+        new_desc = None if text == "-" else text
+        try:
+            mcp_registry.update_mcp(
+                tg_id, domain_name, draft["edit_name"],
+                description=new_desc,
+            )
+        except mcp_registry.MCPRegistryError as exc:
+            await message.answer(f"❌ {_html.escape(str(exc))}")
+            _MCP_DRAFT.pop(tg_id, None)
+            _set_wait(tg_id, "platform")
+            return True
+        _MCP_DRAFT.pop(tg_id, None)
+        _set_wait(tg_id, "platform")
+        await message.answer(
+            f"✅ Описание MCP <b>{_html.escape(draft['edit_name'])}</b> обновлено.",
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    return False
 
 
 # ── FR-P11: reset chat context ───────────────────────────────────
@@ -520,6 +787,13 @@ async def platform_handle_message(message: Message) -> bool:
     wait = _get_wait(tg_id)
     if wait is None:
         return False
+
+    # 0. MCP add/edit FSM — routes back to _handle_mcp_fsm which owns
+    # its own in-progress draft dict.
+    if wait == _mcp_wait_key(tg_id):
+        handled = await _handle_mcp_fsm(message)
+        if handled:
+            return True
 
     # 1. New domain name input
     if wait == "new_domain" and message.text:
