@@ -119,8 +119,9 @@ Non-Functional Requirements
 
 | ID    | Requirement                                                                                 |
 | ----- | ------------------------------------------------------------------------------------------- |
-| NFR-4 | Resolver должен использовать порядок exact match → alias match → fuzzy match                |
-| NFR-5 | При указании версии система должна использовать ровно указанную версию; без версии — latest |
+| NFR-4  | Resolver должен использовать порядок exact match → alias match → fuzzy match                                                                 |
+| NFR-5  | При указании версии система должна использовать ровно указанную версию; без версии — latest                                                  |
+| NFR-13 | Если полный контент файла превышает лимит context window, assemble должен запускать map-reduce summarization: чанки → суммари → финальный свод |
 
 ---
 
@@ -388,6 +389,7 @@ Graph re-evaluation запускается только если:
 | NFR-10 | `tests/test_us3_execution.py`    |
 | NFR-11 | `tests/test_us3_execution.py`    |
 | NFR-12 | `tests/test_us3_execution.py`    |
+| NFR-13 | `tests/test_us1_memory.py`       |
 
 > На момент фиксации v1-спеки многие поведения ещё не реализованы в коде (`services/platform.py` описывает legacy domain-based API из FR-P1..P19). Тесты под ещё не реализованные требования помечены `pytest.skip(...)` с явным `TODO` — они образуют spec-driven roadmap и активируются по мере реализации соответствующих модулей.
 

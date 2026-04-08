@@ -144,11 +144,56 @@ def test_fr_5_full_context_assembly_uses_whole_object(platform_svc, tg_id):
         pytest.skip("TODO FR-5: full-context assembly not implemented")
     platform_svc.create_domain(tg_id, "default")
     doc = platform_svc.register_document(tg_id, "default", "paper.pdf", num_chunks=10)
+    platform_svc.set_object_content(doc.doc_id, "short body")  # type: ignore[attr-defined]
     ctx = platform_svc.assemble_full_context(  # type: ignore[attr-defined]
         tg_id, [doc.doc_id],
     )
     assert ctx.objects[0].doc_id == doc.doc_id
     assert ctx.objects[0].is_full is True
+    assert ctx.objects[0].used_summarization is False
+
+
+# ─────────────────────────────────────────────────────────────────
+# NFR-13 — large-file context triggers map-reduce summarization
+# ─────────────────────────────────────────────────────────────────
+
+def test_nfr_13_oversize_file_triggers_chunked_summarization(platform_svc, tg_id):
+    """NFR-13: если полный контент файла превышает лимит context window,
+    assemble_full_context должен запустить map-reduce:
+    чанки → suммари → финальный свод. В результате `is_full` остаётся True
+    (семантически это весь файл), но `used_summarization=True` и
+    `content` — это не исходник, а свод."""
+    if not hasattr(platform_svc, "assemble_full_context"):
+        pytest.skip("TODO NFR-13: full-context assembly not implemented")
+    platform_svc.create_domain(tg_id, "default")
+    doc = platform_svc.register_document(tg_id, "default", "huge.pdf", num_chunks=500)
+    # Inject a giant body far above the assembly budget.
+    huge = "lorem ipsum dolor sit amet. " * 20000  # ~540k chars
+    platform_svc.set_object_content(doc.doc_id, huge)  # type: ignore[attr-defined]
+
+    ctx = platform_svc.assemble_full_context(  # type: ignore[attr-defined]
+        tg_id, [doc.doc_id], max_chars=20_000,
+    )
+    obj = ctx.objects[0]
+    assert obj.doc_id == doc.doc_id
+    assert obj.is_full is True, "семантически объект подключён целиком"
+    assert obj.used_summarization is True, "должно быть map-reduce сжатие"
+    assert len(obj.content) <= 20_000, "свод не должен превышать max_chars"
+    assert obj.content, "свод не должен быть пустым"
+
+
+def test_nfr_13_small_file_is_not_summarized(platform_svc, tg_id):
+    """NFR-13 negative: маленький файл подключается напрямую, без summarization."""
+    if not hasattr(platform_svc, "assemble_full_context"):
+        pytest.skip("TODO NFR-13: full-context assembly not implemented")
+    platform_svc.create_domain(tg_id, "default")
+    doc = platform_svc.register_document(tg_id, "default", "tiny.txt", num_chunks=1)
+    platform_svc.set_object_content(doc.doc_id, "короткий оригинал")  # type: ignore[attr-defined]
+
+    ctx = platform_svc.assemble_full_context(tg_id, [doc.doc_id], max_chars=20_000)  # type: ignore[attr-defined]
+    obj = ctx.objects[0]
+    assert obj.used_summarization is False
+    assert obj.content == "короткий оригинал"
 
 
 # ─────────────────────────────────────────────────────────────────
