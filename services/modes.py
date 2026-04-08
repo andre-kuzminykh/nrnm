@@ -260,16 +260,35 @@ def start_task(
     graph = _build_graph(goal, attached)
 
     # v1.1 — also build a StructuredPlan via the LLM planner.
+    # FR-25: available tools + descriptions come from the active
+    # domain's MCP registry, NOT a hardcoded list. Planner gets to
+    # pick tools by capability rather than by hardcoded name.
     # The legacy PlanGraph above stays as-is so the US-3 injection
     # tests (inject_failure_on=stage-1) keep matching node ids.
     structured = None
     try:
         from services import llm_planner
+        from services import mcp_registry
+
+        # Pull the first active domain's MCP registry. Fallback to
+        # the hardcoded tuple when no domain is picked yet.
+        try:
+            from services import platform as platform_svc
+            active_list = platform_svc.get_active_domains(tg_id)
+        except Exception:  # noqa: BLE001
+            active_list = []
+        if active_list:
+            mcp_catalog = mcp_registry.list_mcps(tg_id, active_list[0])
+            tool_names = tuple(m.name for m in mcp_catalog) or ("web_search", "pdf_parser")
+        else:
+            mcp_catalog = []
+            tool_names = ("web_search", "pdf_parser")
 
         structured = llm_planner.build_plan(
             goal,
-            available_tools=("web_search", "pdf_parser"),
+            available_tools=tool_names,
             attached_memory=attached,
+            mcp_catalog=mcp_catalog,
         )
     except Exception:  # noqa: BLE001
         structured = None
@@ -324,8 +343,22 @@ def run_advanced(session_id: str):
 
     from services import graph_runtime
 
+    # FR-26: resolve the active domain so tool calls dispatch through
+    # the per-domain MCP registry (not the legacy hardcoded path).
+    active_domain = None
+    try:
+        from services import platform as platform_svc
+        active_list = platform_svc.get_active_domains(session.tg_id)
+        active_domain = active_list[0] if active_list else None
+    except Exception:  # noqa: BLE001
+        pass
+
     session.state = "executing"
-    compiled = graph_runtime.compile_plan(session.structured_plan)
+    compiled = graph_runtime.compile_plan(
+        session.structured_plan,
+        tg_id=session.tg_id,
+        active_domain=active_domain,
+    )
     final_state = graph_runtime.run(compiled, goal=session.goal)
     session.advanced_state = final_state
 

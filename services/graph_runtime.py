@@ -90,6 +90,13 @@ class GraphState:
     trace: list[TraceEvent] = field(default_factory=list)
     replan_signal: str | None = None  # None | "critic_failed" | "goal_drift"
     completed_step_ids: list[str] = field(default_factory=list)
+    # FR-26: when the caller knows which user+domain the run belongs
+    # to, tool calls dispatch via services.mcp_client with the
+    # domain's registered MCP entry. When unset, falls back to the
+    # legacy hardcoded tool_layer.call() path (keeps US-3 injection
+    # tests working).
+    tg_id: int | None = None
+    active_domain: str | None = None
 
 
 # ── Backend detection ────────────────────────────────────────────
@@ -114,31 +121,62 @@ def runtime_backend() -> str:
 @dataclass
 class CompiledPlan:
     """Opaque handle returned by `compile_plan` and consumed by `run`.
-    Carries the original plan + the chosen backend's runner closure."""
+    Carries the original plan, the backend runner closure, and the
+    (tg_id, active_domain) context that step runners capture via
+    closure for MCP dispatch (FR-26)."""
     plan: StructuredPlan
     backend: str
     runner: Callable[[GraphState], GraphState]
+    tg_id: int | None = None
+    active_domain: str | None = None
 
 
-def compile_plan(plan: StructuredPlan) -> CompiledPlan:
-    """FR-20: turn the StructuredPlan into something `run()` can drive."""
+def compile_plan(
+    plan: StructuredPlan,
+    *,
+    tg_id: int | None = None,
+    active_domain: str | None = None,
+) -> CompiledPlan:
+    """FR-20: turn the StructuredPlan into something `run()` can drive.
+
+    `tg_id` + `active_domain` are optional — when supplied, step
+    runners use them to look up tools in the per-domain MCP registry
+    via `services.mcp_client`. Without them, tool calls fall back to
+    the legacy hardcoded `tool_layer.call` path.
+    """
     if _langgraph_available():
-        compiled = _compile_langgraph(plan)
+        compiled = _compile_langgraph(plan, tg_id, active_domain)
     else:
-        compiled = _compile_linear(plan)
+        compiled = _compile_linear(plan, tg_id, active_domain)
     logger.info(
-        "runtime: compiled plan %s (%d steps) -> backend=%s",
-        plan.plan_id, len(plan.steps), compiled.backend,
+        "runtime: compiled plan %s (%d steps) -> backend=%s | domain=%s",
+        plan.plan_id, len(plan.steps), compiled.backend, active_domain or "-",
     )
     return compiled
 
 
-def run(compiled: CompiledPlan, *, goal: str | None = None) -> GraphState:
-    """Drive the compiled plan. Returns the final GraphState."""
-    state = GraphState(goal=goal or compiled.plan.goal)
+def run(
+    compiled: CompiledPlan,
+    *,
+    goal: str | None = None,
+    tg_id: int | None = None,
+    active_domain: str | None = None,
+) -> GraphState:
+    """Drive the compiled plan. Returns the final GraphState.
+
+    `tg_id` / `active_domain` override whatever was baked in at
+    compile time — useful when a reused compiled plan needs a
+    different domain. Absent → fall back to the compile-time values.
+    """
+    state = GraphState(
+        goal=goal or compiled.plan.goal,
+        tg_id=tg_id if tg_id is not None else compiled.tg_id,
+        active_domain=active_domain if active_domain is not None else compiled.active_domain,
+    )
     logger.info(
-        "runtime: invoke %s backend=%s | goal=%r",
-        compiled.plan.plan_id, compiled.backend, (goal or compiled.plan.goal)[:80],
+        "runtime: invoke %s backend=%s | domain=%s | goal=%r",
+        compiled.plan.plan_id, compiled.backend,
+        state.active_domain or "-", (goal or compiled.plan.goal)[:80],
     )
     final = compiled.runner(state)
     logger.info(
@@ -153,12 +191,31 @@ def run(compiled: CompiledPlan, *, goal: str | None = None) -> GraphState:
 # ── Per-step executor (shared by both backends) ──────────────────
 
 
-def _make_step_runner(step: PlanStep, plan: StructuredPlan) -> Callable[[GraphState], GraphState]:
+def _make_step_runner(
+    step: PlanStep,
+    plan: StructuredPlan,
+    tg_id: int | None = None,
+    active_domain: str | None = None,
+) -> Callable[[GraphState], GraphState]:
     """Closure that executes one step + critic + alignment, mutates
-    state in-place, and respects the replan_signal short-circuit."""
+    state in-place, and respects the replan_signal short-circuit.
+
+    `tg_id` / `active_domain` baked in here flow to `_execute_step`
+    via the GraphState object — if the caller didn't already set
+    them on state, we seed from the closure capture. This lets the
+    LangGraph backend avoid threading domain context through the
+    state schema (which would force us into reducer gymnastics).
+    """
 
     def _runner(state: GraphState) -> GraphState:
-        if state.replan_signal is not None:
+        if state.tg_id is None:
+            state.tg_id = tg_id
+        if state.active_domain is None:
+            state.active_domain = active_domain
+        # LangGraph defaults missing Annotated[str, ...] channels to ""
+        # rather than None. Treat empty string as "no signal" so the
+        # short-circuit only fires on a real veto.
+        if state.replan_signal:
             return state  # short-circuit: prior step already vetoed
 
         logger.info(
@@ -239,12 +296,17 @@ def _make_step_runner(step: PlanStep, plan: StructuredPlan) -> Callable[[GraphSt
 def _execute_step(step: PlanStep, state: GraphState) -> Any:
     """Run the actual work of a step.
 
-    - If the step binds a tool, route through `services.tools.call()`
-      so FR-13 whitelist is enforced and tool failures degrade into a
-      proper Result rather than an exception.
-    - If no tool, treat the step as a synthesis / reasoning marker —
-      we just record the description as the result. The critic will
-      judge it on its own merits.
+    - If the step binds a tool and the GraphState carries a
+      (tg_id, active_domain) pair, route through the MCP registry:
+      look up the entry by name and dispatch via `services.mcp_client`.
+      This is the FR-26 path — tool calls are per-domain, transport
+      is decided by the MCP URL scheme.
+    - If no domain context, fall back to the legacy
+      `services.tools.call()` path so existing US-3 tests (which
+      don't set up a domain) keep working.
+    - If no tool at all, treat the step as a synthesis / reasoning
+      marker — record the description as the result. The critic
+      judges it on its own merits.
     """
     if step.tool:
         # Resolve any state references in tool_args (e.g. {"query": "$goal"})
@@ -252,20 +314,22 @@ def _execute_step(step: PlanStep, state: GraphState) -> Any:
             k: state.goal if v == "$goal" else v
             for k, v in (step.tool_args or {}).items()
         }
-        # Inject a default `query` for web_search when missing
-        if step.tool == "web_search" and "query" not in args:
+        # Inject a default `query` for search-y tools when missing
+        if "query" not in args and ("search" in step.tool.lower()):
             args["query"] = state.goal
-        try:
-            result = tool_layer.call(step.tool, args)
-        except tool_layer.DisallowedToolError as exc:
-            return {"error": str(exc)}
+
+        result = _dispatch_tool(step.tool, args, state)
+
+        provider = (result.metadata or {}).get("provider")
+        mcp_url = (result.metadata or {}).get("mcp_url")
         state.trace.append(TraceEvent(
             kind="tool_call",
             node_id=step.id,
             payload={
                 "tool": step.tool,
                 "status": result.status,
-                "provider": result.metadata.get("provider"),
+                "provider": provider,
+                "mcp_url": mcp_url,
             },
         ))
         if result.status != "ok":
@@ -275,6 +339,36 @@ def _execute_step(step: PlanStep, state: GraphState) -> Any:
     # Pure reasoning step — no tool. Use the description as a placeholder
     # synthesis. A real LLM call would go here.
     return {"synthesis": step.description, "based_on": list(state.results.keys())}
+
+
+def _dispatch_tool(tool_name: str, args: dict, state: GraphState):
+    """Route a tool call: MCP registry if we have a domain context,
+    else legacy tool_layer.call. Any failure returns a
+    ToolCallResult(status="error") — never raises up to the runner."""
+    # FR-26: prefer the per-domain MCP registry when we know which
+    # domain the run belongs to.
+    if state.tg_id is not None and state.active_domain:
+        try:
+            from services import mcp_registry
+            from services import mcp_client
+
+            entry = mcp_registry.get_mcp(state.tg_id, state.active_domain, tool_name)
+            if entry is not None:
+                return mcp_client.dispatch(entry, args)
+            # Fall through to legacy if the tool isn't registered.
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("mcp dispatch lookup failed: %s", exc)
+
+    # Legacy fallback: hardcoded tool_layer whitelist. Still enforces
+    # FR-13 (DisallowedToolError for anything outside web_search /
+    # pdf_parser).
+    try:
+        return tool_layer.call(tool_name, args)
+    except tool_layer.DisallowedToolError as exc:
+        return tool_layer.ToolCallResult(
+            status="error", error=str(exc),
+            metadata={"tool": tool_name},
+        )
 
 
 # ── LangGraph backend ────────────────────────────────────────────
@@ -291,6 +385,12 @@ class _LGState(TypedDict, total=False):
     So `results`, `trace`, `completed_step_ids`, AND `replan_signal`
     all carry reducers. `goal` is read-only after initial state, so
     it doesn't need one.
+
+    NOTE on domain context (FR-26): `tg_id` + `active_domain` are
+    NOT part of the LG state schema. They're thread-local to the
+    runner and captured via closure in `_make_step_runner`, which
+    means LangGraph never sees them as channels and there's no
+    risk of concurrent-write conflicts or reducer plumbing.
     """
     goal: str
     results: Annotated[dict, _dict_merge]
@@ -299,7 +399,11 @@ class _LGState(TypedDict, total=False):
     completed_step_ids: Annotated[list, operator.add]
 
 
-def _compile_langgraph(plan: StructuredPlan) -> CompiledPlan:
+def _compile_langgraph(
+    plan: StructuredPlan,
+    tg_id: int | None = None,
+    active_domain: str | None = None,
+) -> CompiledPlan:
     """Build a real `langgraph.StateGraph` from the StructuredPlan.
 
     Parallel branches: when two nodes share a parent and don't depend on
@@ -313,7 +417,7 @@ def _compile_langgraph(plan: StructuredPlan) -> CompiledPlan:
     # Wrap each PlanStep runner so it can convert between LG dict and
     # our dataclass GraphState.
     for step in plan.steps:
-        runner = _make_step_runner(step, plan)
+        runner = _make_step_runner(step, plan, tg_id, active_domain)
         sg.add_node(step.id, _wrap_for_langgraph(runner))
 
     # Sequential edges from depends_on
@@ -343,12 +447,23 @@ def _compile_langgraph(plan: StructuredPlan) -> CompiledPlan:
 
     compiled = sg.compile()
 
+    # Bake domain context into the closure so _make_step_runner's
+    # _execute_step can reach it via state (we stash it on GraphState
+    # right before calling runner(gs) in the adapter).
+    baked_tg_id = tg_id
+    baked_active_domain = active_domain
+
     def _runner(state: GraphState) -> GraphState:
-        initial = {
+        # Propagate compile-time context onto the runtime state so
+        # the per-step adapter copies it into the synthetic gs.
+        if state.tg_id is None:
+            state.tg_id = baked_tg_id
+        if state.active_domain is None:
+            state.active_domain = baked_active_domain
+        initial: dict = {
             "goal": state.goal,
             "results": {},
             "trace": [],
-            "replan_signal": None,
             "completed_step_ids": [],
         }
         try:
@@ -358,11 +473,14 @@ def _compile_langgraph(plan: StructuredPlan) -> CompiledPlan:
             return _compile_linear(plan).runner(state)
         state.results = final.get("results") or {}
         state.trace = final.get("trace") or []
-        state.replan_signal = final.get("replan_signal")
+        state.replan_signal = final.get("replan_signal") or None
         state.completed_step_ids = final.get("completed_step_ids") or []
         return state
 
-    return CompiledPlan(plan=plan, backend="langgraph", runner=_runner)
+    return CompiledPlan(
+        plan=plan, backend="langgraph", runner=_runner,
+        tg_id=tg_id, active_domain=active_domain,
+    )
 
 
 def _wrap_for_langgraph(runner: Callable[[GraphState], GraphState]):
@@ -376,11 +494,17 @@ def _wrap_for_langgraph(runner: Callable[[GraphState], GraphState]):
     change. Minimal updates = no phantom conflicts.
     """
     def _adapter(state: dict) -> dict:
+        # Domain context (tg_id / active_domain) is captured in the
+        # runner closure, NOT threaded through LG state — see
+        # `_LGState` docstring for why.
         gs = GraphState(
             goal=state.get("goal", ""),
             results=dict(state.get("results") or {}),
             trace=list(state.get("trace") or []),
-            replan_signal=state.get("replan_signal"),
+            # LangGraph normalises missing Annotated[str, ...] to "",
+            # not None — coerce back to None so our short-circuit
+            # checks work.
+            replan_signal=(state.get("replan_signal") or None),
             completed_step_ids=list(state.get("completed_step_ids") or []),
         )
         prior_trace_len = len(gs.trace)
@@ -430,7 +554,11 @@ def _make_conditional_router(cond: ConditionalEdge):
 # ── Linear backend (NFR-14 fallback) ─────────────────────────────
 
 
-def _compile_linear(plan: StructuredPlan) -> CompiledPlan:
+def _compile_linear(
+    plan: StructuredPlan,
+    tg_id: int | None = None,
+    active_domain: str | None = None,
+) -> CompiledPlan:
     """Topologically sort the plan and walk it sequentially."""
     order = _topological_sort(plan)
 
@@ -441,10 +569,13 @@ def _compile_linear(plan: StructuredPlan) -> CompiledPlan:
             step = next((s for s in plan.steps if s.id == sid), None)
             if step is None:
                 continue
-            _make_step_runner(step, plan)(state)
+            _make_step_runner(step, plan, tg_id, active_domain)(state)
         return state
 
-    return CompiledPlan(plan=plan, backend="linear", runner=_runner)
+    return CompiledPlan(
+        plan=plan, backend="linear", runner=_runner,
+        tg_id=tg_id, active_domain=active_domain,
+    )
 
 
 def _topological_sort(plan: StructuredPlan) -> list[str]:
