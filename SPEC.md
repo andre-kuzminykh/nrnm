@@ -223,14 +223,39 @@ Functional Requirements
 | FR-15 | Для каждого этапа система должна иметь expected result и acceptance criteria                                                                         |
 | FR-16 | Если фактический результат не соответствует expected result, система должна пересобрать граф выполнения                                              |
 | FR-17 | Если пересобранный граф materially меняет будущие действия, система должна повторно показать обновлённый план пользователю и получить подтверждение  |
+| FR-18 | План должен генерироваться LLM из текстовой цели как структурированная последовательность шагов с привязкой к инструментам                           |
+| FR-19 | План должен поддерживать параллельные ветви (fan-out/fan-in), последовательные цепочки и условные переходы (conditional edges)                       |
+| FR-20 | Executor должен компилировать план в граф LangGraph и запускать его (parallel + sequential + conditional)                                            |
+| FR-21 | После каждого шага запускается LLM-критик: верификация результата против expected_result, бинарный verdict pass/fail с обоснованием                  |
+| FR-22 | После каждого шага запускается goal-alignment проверка: drift от исходной цели, при превышении порога — триггер replan/redesign                      |
 
 Non-Functional Requirements
 
-| ID     | Requirement                                                                                                  |
-| ------ | ------------------------------------------------------------------------------------------------------------ |
-| NFR-10 | Все tool calls и node results должны быть traceable                                                          |
-| NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными                   |
-| NFR-12 | Каждый task run в режиме Задачи должен содержать `plan_preview`, `execution_trace` и `result_summary` (100%) |
+| ID     | Requirement                                                                                                                                                              |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| NFR-10 | Все tool calls и node results должны быть traceable                                                                                                                      |
+| NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными                                                                               |
+| NFR-12 | Каждый task run в режиме Задачи должен содержать `plan_preview`, `execution_trace` и `result_summary` (100%)                                                             |
+| NFR-14 | LLM-компоненты (planner, critic, alignment) должны иметь deterministic stub fallback на случай отсутствия API-ключа / langgraph — для offline dev и CI                   |
+
+---
+
+# User Story 4 — LLM-driven planner + LangGraph runtime + critic loop
+
+**Role**: Пользователь, ставящий сложную задачу.
+
+**Story**: Как пользователь, я хочу, чтобы бот сам разбирал мою цель на структурированный план шагов с явными вызовами инструментов, запускал их через настоящий LangGraph (с параллелизмом и условиями), и после каждого шага критически проверял результат и сверялся с целью — чтобы не уходить в дрейф.
+
+**UX**: Пользователь в режиме Задачи пишет цель → бот строит план через LLM → показывает граф (с метками PARALLEL / IF / SEQ) → подтверждение → каждый шаг исполняется + критикуется + сверяется с целью → итоговый ответ либо replan при дрейфе.
+
+#### Use Case UC-4.1 — LLM план + LangGraph + critic loop
+
+* **Given**: пользователь в режиме Задачи, OpenAI API доступен.
+* **When**: ставит цель.
+* **Then**: planner вызывает LLM → возвращает `StructuredPlan` с шагами, `depends_on`, `parallel_groups`, `conditional_edges`. Executor компилирует в `langgraph.StateGraph`. После каждого ноды — critic + alignment. Критик-fail → `replan_signal=critic_failed`. Drift > порога → `replan_signal=goal_drift`. На выходе run несёт plan_preview, execution_trace, result_summary.
+* **Input**: goal text, attached memory.
+* **Output**: structured plan + run state + critic verdicts + alignment scores per step.
+* **State**: LangGraph compiled and invoked; после каждой ноды — verdict trace event.
 
 ---
 
@@ -394,6 +419,12 @@ Graph re-evaluation запускается только если:
 | NFR-11 | `tests/test_us3_execution.py`    |
 | NFR-12 | `tests/test_us3_execution.py`    |
 | NFR-13 | `tests/test_us1_memory.py`       |
+| FR-18  | `tests/test_us4_advanced_planner.py` |
+| FR-19  | `tests/test_us4_advanced_planner.py` |
+| FR-20  | `tests/test_us4_advanced_planner.py` |
+| FR-21  | `tests/test_us4_advanced_planner.py` |
+| FR-22  | `tests/test_us4_advanced_planner.py` |
+| NFR-14 | `tests/test_us4_advanced_planner.py` |
 
 > На момент фиксации v1-спеки многие поведения ещё не реализованы в коде (`services/platform.py` описывает legacy domain-based API из FR-P1..P19). Тесты под ещё не реализованные требования помечены `pytest.skip(...)` с явным `TODO` — они образуют spec-driven roadmap и активируются по мере реализации соответствующих модулей.
 
