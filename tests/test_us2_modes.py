@@ -61,6 +61,22 @@ def test_fr_7_chat_retrieves_from_memory(platform_svc, tg_id):
     assert result.used_context, "Chat must use Memory as a context source"
 
 
+def test_fr_7_chat_offers_save_to_memory_suggestion(platform_svc, tg_id):
+    """FR-7 + UC-2.1 Output: после ответа в режиме Чат система должна
+    уметь предложить пользователю сохранить результат обратно в Память
+    (поле `save_suggestion` / аналог)."""
+    modes = _modes_api()
+    if modes is None:
+        pytest.skip("TODO FR-7: Chat Runtime save-to-memory suggestion not implemented")
+    platform_svc.create_domain(tg_id, "default")
+    platform_svc.register_document(tg_id, "default", "facts.txt", num_chunks=3)
+    result = modes.chat_answer(tg_id, "Summarise the facts")  # type: ignore[attr-defined]
+    # Не требуем, чтобы suggestion был всегда True — достаточно чтобы поле
+    # существовало и было булевым, т.е. runtime явно решает показывать его или нет.
+    assert hasattr(result, "save_suggestion")
+    assert isinstance(result.save_suggestion, bool)
+
+
 # ─────────────────────────────────────────────────────────────────
 # FR-8 — Chat must not build execution graph for simple queries
 # ─────────────────────────────────────────────────────────────────

@@ -225,10 +225,11 @@ Functional Requirements
 
 Non-Functional Requirements
 
-| ID     | Requirement                                                                                |
-| ------ | ------------------------------------------------------------------------------------------ |
-| NFR-10 | Все tool calls и node results должны быть traceable                                        |
-| NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными |
+| ID     | Requirement                                                                                                  |
+| ------ | ------------------------------------------------------------------------------------------------------------ |
+| NFR-10 | Все tool calls и node results должны быть traceable                                                          |
+| NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными                   |
+| NFR-12 | Каждый task run в режиме Задачи должен содержать `plan_preview`, `execution_trace` и `result_summary` (100%) |
 
 ---
 
@@ -386,5 +387,29 @@ Graph re-evaluation запускается только если:
 | FR-17  | `tests/test_us3_execution.py`    |
 | NFR-10 | `tests/test_us3_execution.py`    |
 | NFR-11 | `tests/test_us3_execution.py`    |
+| NFR-12 | `tests/test_us3_execution.py`    |
 
 > На момент фиксации v1-спеки многие поведения ещё не реализованы в коде (`services/platform.py` описывает legacy domain-based API из FR-P1..P19). Тесты под ещё не реализованные требования помечены `pytest.skip(...)` с явным `TODO` — они образуют spec-driven roadmap и активируются по мере реализации соответствующих модулей.
+
+### 6.1 Product Rule → Requirement mapping
+
+| Rule                                          | Покрывают требования           |
+| --------------------------------------------- | ------------------------------ |
+| R1. Unified Memory                            | FR-1, FR-2, NFR-3              |
+| R2. Only Two Modes                            | FR-6, FR-9                     |
+| R3. Limited Tools in v1 (web / pdf / ctx)     | FR-13, FR-14                   |
+| R4. Full Planning Before Execution            | FR-10, FR-11, NFR-9            |
+| R5. Replanning Only on Deviation              | FR-16 (+ все 5 суб-триггеров)  |
+| R6. Versioning (новая версия, старая живёт)   | FR-3, NFR-5                    |
+
+### 6.2 Rule 5 — триггеры replanning
+
+Replanning (FR-16) должен активироваться **только** при одном из 5 условий:
+
+1. Не получен `expected_result` у stage.
+2. Stage не прошёл `acceptance_criteria`.
+3. Tool failure blocks progress.
+4. Отсутствует нужный input.
+5. Пользователь изменил constraints.
+
+В остальных случаях replanning не запускается — покрыто negative-тестом.
