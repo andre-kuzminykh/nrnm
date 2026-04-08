@@ -47,9 +47,39 @@ class Document:
 
 
 @dataclass
+class MCPEntry:
+    """One MCP tool registration inside a domain (FR-23).
+
+    `url` scheme decides dispatch in `services.mcp_client`:
+      - `builtin://serpapi`   → in-process SerpAPI web search
+      - `builtin://pdf_parser`→ in-process pdf parser
+      - `http(s)://...`       → POST to an external MCP server with
+                                 Bearer token auth (token goes to
+                                 `Authorization` header).
+
+    Description is what the LLM planner sees when deciding whether
+    this tool is relevant to a given step. Keep it short and
+    capability-focused.
+    """
+    name: str
+    url: str
+    token: str
+    description: str
+    created_at: str
+    updated_at: str
+
+    @property
+    def is_builtin(self) -> bool:
+        return self.url.startswith("builtin://")
+
+
+@dataclass
 class Domain:
     name: str
     documents: list[Document] = field(default_factory=list)
+    # FR-24: per-domain MCP registry. Bootstrapped with a default
+    # `web_search` entry on `create_domain`.
+    mcps: list[MCPEntry] = field(default_factory=list)
 
 
 @dataclass
@@ -111,6 +141,16 @@ def _migrate_user(u):
                     doc.message_id = None
     except Exception:  # noqa: BLE001
         pass
+    # FR-24: backfill Domain.mcps on pickles saved before the MCP
+    # registry landed. Every domain that doesn't have a `mcps` list
+    # gets the default `web_search` bootstrap so existing users
+    # don't lose tool access after the upgrade.
+    try:
+        for dom in u.domains.values():
+            if not hasattr(dom, "mcps") or dom.mcps is None:
+                dom.mcps = _default_mcp_bootstrap()
+    except Exception:  # noqa: BLE001
+        pass
     return u
 
 
@@ -161,8 +201,31 @@ def collection_name(tg_id: int, domain_name: str) -> str:
     return f"platform-{tg_id}-{_safe_name(domain_name)}"
 
 
+def _default_mcp_bootstrap() -> list[MCPEntry]:
+    """FR-24: every fresh domain gets a default `web_search` MCP so
+    the planner has at least one tool to reach for out of the box.
+    The user can edit / delete it or add more via the bot UI.
+    """
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    return [
+        MCPEntry(
+            name="web_search",
+            url="builtin://serpapi",
+            token="",  # inherits config.SERPAPI_API_KEY
+            description=(
+                "Веб-поиск актуальной информации через SerpAPI (Google). "
+                "Используется для любых задач поиска: новости, факты, "
+                "research, 'найди X', проверка свежих данных."
+            ),
+            created_at=now,
+            updated_at=now,
+        ),
+    ]
+
+
 def create_domain(tg_id: int, name: str) -> Domain:
-    """FR-P3: create a new memory domain. Auto-selects it (FR-P10)."""
+    """FR-P3 + FR-24: create a new memory domain. Auto-selects it
+    (FR-P10) and seeds it with the default `web_search` MCP (FR-24)."""
     name = name.strip()
     if not _DOMAIN_NAME_RE.match(name):
         raise ValueError("Invalid domain name (1-40 chars, letters/digits/space/_-)")
@@ -171,7 +234,7 @@ def create_domain(tg_id: int, name: str) -> Domain:
         u.active_domains.add(name)
         _persist()
         return u.domains[name]
-    u.domains[name] = Domain(name=name)
+    u.domains[name] = Domain(name=name, mcps=_default_mcp_bootstrap())
     u.active_domains.add(name)  # FR-P10: auto-select newly created domain
     _persist()
     return u.domains[name]

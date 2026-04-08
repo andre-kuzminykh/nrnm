@@ -84,9 +84,22 @@ def build_plan(
     available_tools: Iterable[str] = (),
     *,
     attached_memory: list | None = None,
+    mcp_catalog: list | None = None,
 ) -> StructuredPlan:
     """FR-18 entry point. Returns a StructuredPlan ready for
     compilation by `services.graph_runtime.compile_plan`.
+
+    Parameters:
+    - `goal` — natural-language user objective.
+    - `available_tools` — legacy tuple of tool names; still honoured
+      as the strict whitelist the planner must stay inside.
+    - `attached_memory` — resolved memory objects from `[контекст]`
+      refs in the goal (FR-14).
+    - `mcp_catalog` — FR-25: list of `MCPEntry` objects for the
+      active domain. When supplied, the LLM prompt includes each
+      entry's description so the model can pick tools by capability
+      instead of just name. `available_tools` is still enforced as
+      the hard whitelist — names outside it are stripped post-hoc.
 
     Routing:
     - If `config.LLM_API_KEY` is set, call OpenAI with a strict
@@ -95,13 +108,14 @@ def build_plan(
     - Otherwise, return the deterministic stub plan immediately.
     """
     tools = tuple(available_tools)
+    catalog = list(mcp_catalog or [])
     if config.LLM_API_KEY:
         try:
-            plan = _build_plan_via_llm(goal, tools, attached_memory or [])
+            plan = _build_plan_via_llm(goal, tools, attached_memory or [], catalog)
             logger.info(
-                "planner(openai): %d steps, %d parallel groups, %d conditional edges | goal=%r",
+                "planner(openai): %d steps, %d parallel groups, %d conditional edges | tools=%s | goal=%r",
                 len(plan.steps), len(plan.parallel_groups),
-                len(plan.conditional_edges), goal[:80],
+                len(plan.conditional_edges), list(tools), goal[:80],
             )
             return plan
         except Exception as exc:  # noqa: BLE001
@@ -160,14 +174,30 @@ def _build_plan_via_llm(
     goal: str,
     available_tools: tuple[str, ...],
     attached_memory: list,
+    mcp_catalog: list | None = None,
 ) -> StructuredPlan:
     from openai import OpenAI  # local import: only needed in this path
 
     client = OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
 
+    # FR-25: include MCP descriptions when the catalog is supplied so
+    # the LLM picks tools by capability, not just by name. Falls back
+    # gracefully to bare tool names when no catalog is provided.
+    if mcp_catalog:
+        tool_lines = []
+        for entry in mcp_catalog:
+            tool_lines.append(
+                f"- {entry.name}: {entry.description}"
+            )
+        tools_block = "Available tools (with descriptions):\n" + "\n".join(tool_lines)
+    else:
+        tools_block = (
+            f"Available tools: {list(available_tools) or '(none — reasoning only)'}"
+        )
+
     user_prompt = (
         f"Goal: {goal}\n"
-        f"Available tools: {list(available_tools) or '(none — reasoning only)'}\n"
+        f"{tools_block}\n"
         f"Attached memory: "
         f"{[getattr(o, 'filename', '?') for o in attached_memory] or '(none)'}\n\n"
         "Return the JSON plan."
