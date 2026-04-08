@@ -16,17 +16,53 @@ def start_keyboard() -> InlineKeyboardMarkup:
 
 # ── ИИ-платформа keyboards (FR-P1..P19) ──────────────────────────
 
-def platform_menu_keyboard(active_model: str, active_domains: list[str]) -> InlineKeyboardMarkup:
-    """FR-P1 / FR-P11: main platform widget — the widget itself IS the chat.
-    Only two control buttons: model picker and memory picker. Plus a reset
-    button to clear chat history."""
+def platform_menu_keyboard(
+    active_model: str,
+    active_domains: list[str],
+    active_mode: str = "chat",
+) -> InlineKeyboardMarkup:
+    """FR-P1 / FR-P11 / FR-6 / FR-9: main platform widget.
+
+    Adds a v1 mode toggle at the very top — the two modes are Чат and
+    Задачи (Rule 2). Active mode shown with ✅."""
     model_label = active_model or "не выбрана"
     doms = ", ".join(active_domains) if active_domains else "не выбран"
+    chat_mark = "✅ " if active_mode == "chat" else ""
+    task_mark = "✅ " if active_mode == "task" else ""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"{chat_mark}💬 Чат", callback_data="platform_mode:chat"),
+            InlineKeyboardButton(text=f"{task_mark}🎯 Задачи", callback_data="platform_mode:task"),
+        ],
         [InlineKeyboardButton(text=f"🤖 {model_label}", callback_data="platform_model")],
         [InlineKeyboardButton(text=f"💾 Память: {doms}", callback_data="platform_memory")],
         [InlineKeyboardButton(text="🔄 Сбросить контекст", callback_data="platform_reset")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+    ])
+
+
+def task_approval_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    """FR-11 / NFR-9: two-button approval gate for a draft task plan.
+
+    Shown under the plan preview. Accept -> `execute()`; Reject drops
+    the session and returns the user to the platform widget.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить план", callback_data=f"task_approve:{session_id}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"task_reject:{session_id}"),
+        ],
+    ])
+
+
+def task_reapproval_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    """FR-17: material replan triggered — user must re-confirm the
+    revised plan before the executor resumes."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить новый план", callback_data=f"task_reapprove:{session_id}"),
+            InlineKeyboardButton(text="❌ Прервать задачу", callback_data=f"task_reject:{session_id}"),
+        ],
     ])
 
 

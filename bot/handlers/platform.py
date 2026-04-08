@@ -27,11 +27,15 @@ from dataclasses import dataclass
 from aiogram import Router, F
 from aiogram.enums import ContentType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
 import config
 from services import platform as platform_svc
 from services import rag
+from services import modes as modes_svc
+from services import context_resolver
+from services import memory as memory_svc
 from bot.keyboards.inline import (
     platform_menu_keyboard,
     platform_model_keyboard,
@@ -40,6 +44,8 @@ from bot.keyboards.inline import (
     platform_domain_keyboard,
     platform_doc_keyboard,
     platform_answer_keyboard,
+    task_approval_keyboard,
+    task_reapproval_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,18 +97,33 @@ def _model_label(model_id: str) -> str:
     )
 
 
-def _menu_text(user: platform_svc.PlatformUser) -> str:
+def _mode_label(mode: str) -> str:
+    return {"chat": "💬 Чат", "task": "🎯 Задачи"}.get(mode, mode)
+
+
+def _menu_text(user: platform_svc.PlatformUser, tg_id: int | None = None) -> str:
     active = platform_svc.get_active_domains_for(user)
+    mode = modes_svc.get_mode(tg_id) if tg_id is not None else "chat"
     text = (
         "🧠 <b>ИИ-платформа</b>\n\n"
+        f"<b>Режим:</b> {_mode_label(mode)}\n"
         f"<b>Модель:</b> {_html.escape(_model_label(user.model_id))}\n"
         f"<b>Домены:</b> {_html.escape(', '.join(active) or 'не выбраны')}\n\n"
-        "<i>Отправьте сообщение — я отвечу на основе выбранных доменов.\n"
-        "Отправьте файл (txt/md/pdf/docx) — он будет добавлен в память.</i>"
     )
+    if mode == "chat":
+        text += (
+            "<i>Отправьте сообщение — отвечу с учётом Памяти.\n"
+            "Подключайте файл целиком через <code>[имя_файла]</code> или "
+            "<code>[имя@v2]</code>. Файл — в чат для загрузки в Память.</i>"
+        )
+    else:
+        text += (
+            "<i>Опишите цель — я построю полный план и покажу его "
+            "перед выполнением. План нужно подтвердить.</i>"
+        )
     if not rag.is_configured():
         text += "\n\n<i>⚠️ RAG не сконфигурирован (QDRANT_URL).</i>"
-    if not active:
+    if not active and mode == "chat":
         text += "\n\n<i>ℹ️ Выберите домен в «💾 Память» чтобы начать диалог.</i>"
     return text
 
@@ -124,13 +145,59 @@ async def on_platform_menu(callback: CallbackQuery):
     user = platform_svc.get_user(tg_id)
     _set_wait(tg_id, "platform")
     await _replace_widget(
-        callback.message, _menu_text(user),
+        callback.message, _menu_text(user, tg_id),
         reply_markup=platform_menu_keyboard(
-            _model_label(user.model_id), platform_svc.get_active_domains(tg_id)
+            _model_label(user.model_id),
+            platform_svc.get_active_domains(tg_id),
+            active_mode=modes_svc.get_mode(tg_id),
         ),
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
+
+
+# ── FR-6 / FR-9 / Rule 2: mode toggle ────────────────────────────
+
+@router.callback_query(F.data.startswith("platform_mode:"))
+async def on_platform_mode_switch(callback: CallbackQuery):
+    mode = callback.data.split(":", 1)[1]
+    try:
+        modes_svc.set_mode(callback.from_user.id, mode)
+    except ValueError as e:
+        await callback.answer(str(e), show_alert=True)
+        return
+    await callback.answer(f"Режим: {_mode_label(mode)}")
+    await on_platform_menu(callback)
+
+
+@router.message(Command("chat"))
+async def cmd_chat(message: Message):
+    modes_svc.set_mode(message.from_user.id, "chat")
+    await message.answer(
+        f"✅ Режим: <b>{_mode_label('chat')}</b>\n\n"
+        "Пишите вопрос — отвечу с учётом Памяти.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("task"))
+async def cmd_task(message: Message):
+    modes_svc.set_mode(message.from_user.id, "task")
+    await message.answer(
+        f"✅ Режим: <b>{_mode_label('task')}</b>\n\n"
+        "Опишите цель — построю план и покажу перед выполнением.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("mode"))
+async def cmd_mode(message: Message):
+    mode = modes_svc.get_mode(message.from_user.id)
+    await message.answer(
+        f"Текущий режим: <b>{_mode_label(mode)}</b>\n\n"
+        "Переключение: /chat или /task",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ── FR-P2: model picker ──────────────────────────────────────────
@@ -429,10 +496,13 @@ async def _ingest_file(message: Message) -> None:
         await status.edit_text(f"❌ Индексирование <b>{_html.escape(filename)}</b> не удалось.",
                                parse_mode=ParseMode.HTML)
         return
-    platform_svc.register_document(
+    doc = platform_svc.register_document(
         tg_id, domain_name, filename, n_chunks,
         message_id=message.message_id,  # FR-P18
     )
+    # FR-5: stash the full extracted body so [контекст]/[file] can pull
+    # the whole document later without re-downloading / re-parsing.
+    memory_svc.set_object_content(doc.doc_id, text_content)
     await status.edit_text(
         f"✅ <b>{_html.escape(filename)}</b> — {n_chunks} фрагментов в домене "
         f"<b>{_html.escape(domain_name)}</b>.",
@@ -470,17 +540,54 @@ async def platform_handle_message(message: Message) -> bool:
         )
         return True
 
-    # 2. Platform chat — any text becomes a RAG question
+    # 2. Platform — route by active mode
     if wait == "platform":
         if message.document:
             await _ingest_file(message)
             return True
         if not message.text:
             return True
-        await _handle_rag_chat(message)
+        mode = modes_svc.get_mode(tg_id)
+        if mode == "task":
+            await _handle_task_goal(message)
+        else:
+            await _handle_rag_chat(message)
         return True
 
     return False
+
+
+# ── FR-9..11: Task mode — goal → plan preview → approval ─────────
+
+async def _handle_task_goal(message: Message) -> None:
+    """Task mode entry: build full plan, show human-readable preview
+    with an approval keyboard. Execution does NOT start yet (NFR-9)."""
+    tg_id = message.from_user.id
+    goal = (message.text or "").strip()
+    if not goal:
+        return
+
+    session = modes_svc.start_task(tg_id, goal)
+
+    attached_names = [
+        getattr(o, "filename", None) or "—"
+        for o in session.plan.attached_memory
+    ]
+    attached_block = ""
+    if attached_names:
+        attached_block = (
+            "\n\n<b>Подключённая Память:</b>\n"
+            + "\n".join(f"• 📎 <code>{_html.escape(n)}</code>" for n in attached_names)
+        )
+
+    preview_html = _html.escape(session.plan.human_readable)
+    await message.answer(
+        f"🎯 <b>Задача</b>\n\n"
+        f"<b>Цель:</b> {_html.escape(goal)}{attached_block}\n\n"
+        f"<pre>{preview_html}</pre>",
+        reply_markup=task_approval_keyboard(session.id),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def _handle_rag_chat(message: Message) -> None:
@@ -499,6 +606,37 @@ async def _handle_rag_chat(message: Message) -> None:
     question = message.text or ""
     platform_svc.add_chat_message(tg_id, "user", question)
 
+    # FR-4 / FR-5 / NFR-13: `[контекст]` / `[file@v2]` preprocessing.
+    # If the user embedded explicit refs, resolve them and pull the full
+    # file(s) into the prompt via assemble_full_context — this bypasses
+    # the top-k RAG path so the LLM sees the whole document (with
+    # map-reduce summarization when oversize).
+    explicit_refs = context_resolver.parse_context_refs(question)
+    explicit_context_block = ""
+    if explicit_refs:
+        resolved_ids: list[str] = []
+        for ref in explicit_refs:
+            res = context_resolver.resolve_context_ref(tg_id, ref.name)
+            if res.matched is not None:
+                eid = (
+                    getattr(res.matched, "doc_id", None)
+                    or getattr(res.matched, "memory_object_id", None)
+                )
+                if eid:
+                    resolved_ids.append(eid)
+        if resolved_ids:
+            bundle = context_resolver.assemble_full_context(tg_id, resolved_ids)
+            chunks: list[str] = []
+            for obj in bundle.objects:
+                if not obj.content:
+                    continue
+                marker = "[СВОД]" if obj.used_summarization else "[ПОЛНЫЙ ФАЙЛ]"
+                chunks.append(
+                    f"{marker} {obj.filename}\n{obj.content}"
+                )
+            if chunks:
+                explicit_context_block = "\n\n---\n\n".join(chunks)
+
     status = await message.answer("⏳ Ищу в памяти…")
     # FR-P9: query top-k across ALL active domains and merge by score
     all_hits: list[dict] = []
@@ -509,27 +647,37 @@ async def _handle_rag_chat(message: Message) -> None:
         all_hits.extend(hits)
     all_hits.sort(key=lambda h: -h["score"])
     top = all_hits[:5]
-    if not top:
+    if not top and not explicit_context_block:
         await status.edit_text("❌ В выбранных доменах ничего релевантного не нашёл.")
         return
 
     # FR-P18: build numbered source list deduped by filename so each unique
     # source gets a single [N] marker. Each chunk references its file's number,
     # which the LLM is instructed to use inline.
-    sources, chunk_to_idx = _build_sources(top)
-    context = "\n\n---\n\n".join(
+    sources, chunk_to_idx = _build_sources(top) if top else ([], [])
+    rag_context = "\n\n---\n\n".join(
         f"[{chunk_to_idx[i]}] ({h['filename']}): {h['text']}"
         for i, h in enumerate(top)
     )
+
+    # Merge the explicit full-file block (FR-5) with the top-k RAG excerpts.
+    # Full files come first so the model sees them as the primary context.
+    context_parts: list[str] = []
+    if explicit_context_block:
+        context_parts.append(explicit_context_block)
+    if rag_context:
+        context_parts.append(rag_context)
+    context = "\n\n===\n\n".join(context_parts)
 
     # Build chat history for LLM (system + last 10 turns + current context)
     messages = [{
         "role": "system",
         "content": (
             "Ты — помощник, отвечающий на основе контекста из базы знаний пользователя. "
-            "Каждый фрагмент контекста начинается с маркера вида [1], [2] и т.д. "
-            "Когда используешь информацию из фрагмента — обязательно ставь его номер "
-            "в квадратных скобках сразу после соответствующего утверждения, например: "
+            "Если в контексте есть секция [ПОЛНЫЙ ФАЙЛ] или [СВОД], это явно подключённый "
+            "пользователем файл — используй его как основной источник. "
+            "Фрагменты вида [1], [2] — это top-k поиск; ставь их номер в квадратных "
+            "скобках сразу после утверждения, использующего этот фрагмент, например: "
             "«Apollo 11 высадился на Луне в 1969 году [2].» "
             "Если в контексте нет ответа — так и скажи, не выдумывай."
         ),
@@ -687,6 +835,96 @@ def _extract_text(data: bytes, filename: str) -> str:
         return data.decode("utf-8", errors="ignore")
     except Exception:  # noqa: BLE001
         return ""
+
+
+# ── FR-11 / FR-17 / NFR-9: task approval callbacks ──────────────
+
+def _render_run_summary(run) -> str:
+    """Compact human-readable summary of a finished / partial task run,
+    covering plan preview + stages walked + trace count + final outcome
+    (NFR-12 artefacts in one message)."""
+    stage_lines = [
+        f"  • {s.node_id}: {'✅' if s.status == 'pass' else '❌'}"
+        for s in run.stages
+    ]
+    summary = run.result_summary or {}
+    outcome = summary.get("outcome", "—")
+    reason = summary.get("reason", "")
+    reason_line = f"\n<b>Причина:</b> {_html.escape(str(reason))}" if reason else ""
+    stages_block = "\n".join(stage_lines) if stage_lines else "  • (нет этапов)"
+    return (
+        f"<b>Этапы:</b>\n{stages_block}\n\n"
+        f"<b>Trace events:</b> {len(run.execution_trace)}\n"
+        f"<b>Результат:</b> {_html.escape(str(outcome))}{reason_line}"
+    )
+
+
+@router.callback_query(F.data.startswith("task_approve:"))
+async def on_task_approve(callback: CallbackQuery):
+    session_id = callback.data.split(":", 1)[1]
+    try:
+        modes_svc.approve_plan(session_id)
+        run = modes_svc.execute(session_id)
+    except KeyError:
+        await callback.answer("Сессия не найдена или уже завершена", show_alert=True)
+        return
+    except modes_svc.ApprovalRequiredError as e:
+        await callback.answer(str(e), show_alert=True)
+        return
+
+    if run.state == "awaiting_approval" and run.revised_plan is not None:
+        # FR-17: material diff — show revised plan and ask again
+        revised = run.revised_plan
+        await callback.message.answer(
+            "🔁 <b>План перестроен</b>\n\n"
+            f"<b>Причина:</b> {_html.escape(revised.reason)}\n"
+            f"<b>Material diff:</b> да\n\n"
+            f"<pre>{_html.escape(revised.human_readable)}</pre>",
+            reply_markup=task_reapproval_keyboard(session_id),
+            parse_mode=ParseMode.HTML,
+        )
+        await callback.answer("План перестроен, требуется повторное подтверждение")
+        return
+
+    await callback.message.answer(
+        f"✅ <b>Задача выполнена</b>\n\n{_render_run_summary(run)}",
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer("Готово")
+
+
+@router.callback_query(F.data.startswith("task_reapprove:"))
+async def on_task_reapprove(callback: CallbackQuery):
+    """FR-17: user confirms the revised plan — resume execution."""
+    session_id = callback.data.split(":", 1)[1]
+    try:
+        session = modes_svc.get_session(session_id)
+    except KeyError:
+        await callback.answer("Сессия не найдена", show_alert=True)
+        return
+    # Swap the live plan with the revised one and re-arm for execute()
+    if session.run and session.run.revised_plan:
+        session.plan.graph = session.run.revised_plan.graph
+        session.plan.human_readable = session.run.revised_plan.human_readable
+    session.state = "executing"
+    session.run = None  # fresh run against the revised graph
+    run = modes_svc.execute(session_id)
+    await callback.message.answer(
+        f"✅ <b>Задача выполнена (revised)</b>\n\n{_render_run_summary(run)}",
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer("Готово")
+
+
+@router.callback_query(F.data.startswith("task_reject:"))
+async def on_task_reject(callback: CallbackQuery):
+    session_id = callback.data.split(":", 1)[1]
+    modes_svc._SESSIONS.pop(session_id, None)
+    await callback.message.answer(
+        "❌ Задача отменена. Можете поставить новую.",
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
 
 
 # ── Standalone catch-all text handler ────────────────────────────
