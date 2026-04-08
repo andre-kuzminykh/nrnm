@@ -97,10 +97,21 @@ def build_plan(
     tools = tuple(available_tools)
     if config.LLM_API_KEY:
         try:
-            return _build_plan_via_llm(goal, tools, attached_memory or [])
+            plan = _build_plan_via_llm(goal, tools, attached_memory or [])
+            logger.info(
+                "planner(openai): %d steps, %d parallel groups, %d conditional edges | goal=%r",
+                len(plan.steps), len(plan.parallel_groups),
+                len(plan.conditional_edges), goal[:80],
+            )
+            return plan
         except Exception as exc:  # noqa: BLE001
             logger.warning("LLM planner failed, falling back to stub: %s", exc)
-    return _build_plan_stub(goal, tools, attached_memory or [])
+    plan = _build_plan_stub(goal, tools, attached_memory or [])
+    logger.info(
+        "planner(stub): %d steps, tools=%s | goal=%r",
+        len(plan.steps), list(tools), goal[:80],
+    )
+    return plan
 
 
 # ── LLM provider ─────────────────────────────────────────────────

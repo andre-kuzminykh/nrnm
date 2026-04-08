@@ -93,14 +93,31 @@ class CompiledPlan:
 def compile_plan(plan: StructuredPlan) -> CompiledPlan:
     """FR-20: turn the StructuredPlan into something `run()` can drive."""
     if _langgraph_available():
-        return _compile_langgraph(plan)
-    return _compile_linear(plan)
+        compiled = _compile_langgraph(plan)
+    else:
+        compiled = _compile_linear(plan)
+    logger.info(
+        "runtime: compiled plan %s (%d steps) -> backend=%s",
+        plan.plan_id, len(plan.steps), compiled.backend,
+    )
+    return compiled
 
 
 def run(compiled: CompiledPlan, *, goal: str | None = None) -> GraphState:
     """Drive the compiled plan. Returns the final GraphState."""
     state = GraphState(goal=goal or compiled.plan.goal)
-    return compiled.runner(state)
+    logger.info(
+        "runtime: invoke %s backend=%s | goal=%r",
+        compiled.plan.plan_id, compiled.backend, (goal or compiled.plan.goal)[:80],
+    )
+    final = compiled.runner(state)
+    logger.info(
+        "runtime: done %s backend=%s | completed=%d/%d | replan=%s | trace=%d",
+        compiled.plan.plan_id, compiled.backend,
+        len(final.completed_step_ids), len(compiled.plan.steps),
+        final.replan_signal, len(final.trace),
+    )
+    return final
 
 
 # ── Per-step executor (shared by both backends) ──────────────────
@@ -113,6 +130,11 @@ def _make_step_runner(step: PlanStep, plan: StructuredPlan) -> Callable[[GraphSt
     def _runner(state: GraphState) -> GraphState:
         if state.replan_signal is not None:
             return state  # short-circuit: prior step already vetoed
+
+        logger.info(
+            "runtime: [%s] start | tool=%s | desc=%r",
+            step.id, step.tool or "reasoning", step.description[:80],
+        )
 
         # 1. Execute the step
         result = _execute_step(step, state)
@@ -139,7 +161,12 @@ def _make_step_runner(step: PlanStep, plan: StructuredPlan) -> Callable[[GraphSt
                 "provider": verdict.provider,
             },
         ))
+        logger.info(
+            "runtime: [%s] critic(%s)=%s | reason=%r",
+            step.id, verdict.provider, verdict.verdict, verdict.reason[:80],
+        )
         if verdict.verdict == "fail":
+            logger.warning("runtime: [%s] CRITIC VETO -> replan_signal=critic_failed", step.id)
             state.replan_signal = "critic_failed"
             return state
 
@@ -159,12 +186,21 @@ def _make_step_runner(step: PlanStep, plan: StructuredPlan) -> Callable[[GraphSt
                 "provider": align.provider,
             },
         ))
+        logger.info(
+            "runtime: [%s] alignment(%s)=%.2f replan=%s",
+            step.id, align.provider, align.drift, align.should_replan,
+        )
         if align.should_replan:
+            logger.warning(
+                "runtime: [%s] DRIFT %.2f>threshold -> replan_signal=goal_drift",
+                step.id, align.drift,
+            )
             state.replan_signal = "goal_drift"
             return state
 
         # 4. Step completed cleanly
         state.completed_step_ids.append(step.id)
+        logger.info("runtime: [%s] done", step.id)
         return state
 
     return _runner

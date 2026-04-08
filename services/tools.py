@@ -118,6 +118,10 @@ def _web_search_serpapi(query: str, num: int = 5) -> ToolCallResult:
             "snippet": ab.get("answer") or ab.get("snippet") or "",
         })
 
+    logger.info(
+        "tool(web_search/serpapi): ok | query=%r | hits=%d | answer_box=%s",
+        query[:80], len(hits), bool(ab),
+    )
     return ToolCallResult(
         status="ok",
         output={"hits": hits},
