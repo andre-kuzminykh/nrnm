@@ -39,3 +39,12 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
 # Lightweight aiohttp endpoint for Docker / GCE healthchecks.
 # GET /health → 200 {"status": "ok", "service": "nrnm-platform-bot"}
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8003"))
+
+# ── Tool layer — v1 integrations ─────────────────────────────────
+# SerpAPI is the default web_search provider (FR-13). If SERPAPI_API_KEY
+# is empty the tool falls back to a deterministic stub so the bot can
+# still boot and the executor pipeline runs in tests / offline dev.
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "")
+SERPAPI_ENDPOINT = os.getenv("SERPAPI_ENDPOINT", "https://serpapi.com/search")
+SERPAPI_ENGINE = os.getenv("SERPAPI_ENGINE", "google")
+SERPAPI_TIMEOUT = float(os.getenv("SERPAPI_TIMEOUT", "8.0"))

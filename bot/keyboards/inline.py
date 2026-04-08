@@ -16,17 +16,53 @@ def start_keyboard() -> InlineKeyboardMarkup:
 
 # ── ИИ-платформа keyboards (FR-P1..P19) ──────────────────────────
 
-def platform_menu_keyboard(active_model: str, active_domains: list[str]) -> InlineKeyboardMarkup:
-    """FR-P1 / FR-P11: main platform widget — the widget itself IS the chat.
-    Only two control buttons: model picker and memory picker. Plus a reset
-    button to clear chat history."""
+def platform_menu_keyboard(
+    active_model: str,
+    active_domains: list[str],
+    active_mode: str = "chat",
+) -> InlineKeyboardMarkup:
+    """FR-P1 / FR-P11 / FR-6 / FR-9: main platform widget.
+
+    Adds a v1 mode toggle at the very top — the two modes are Чат and
+    Задачи (Rule 2). Active mode shown with ✅."""
     model_label = active_model or "не выбрана"
     doms = ", ".join(active_domains) if active_domains else "не выбран"
+    chat_mark = "✅ " if active_mode == "chat" else ""
+    task_mark = "✅ " if active_mode == "task" else ""
     return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"{chat_mark}💬 Чат", callback_data="platform_mode:chat"),
+            InlineKeyboardButton(text=f"{task_mark}🎯 Задачи", callback_data="platform_mode:task"),
+        ],
         [InlineKeyboardButton(text=f"🤖 {model_label}", callback_data="platform_model")],
         [InlineKeyboardButton(text=f"💾 Память: {doms}", callback_data="platform_memory")],
         [InlineKeyboardButton(text="🔄 Сбросить контекст", callback_data="platform_reset")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
+    ])
+
+
+def task_approval_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    """FR-11 / NFR-9: two-button approval gate for a draft task plan.
+
+    Shown under the plan preview. Accept -> `execute()`; Reject drops
+    the session and returns the user to the platform widget.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить план", callback_data=f"task_approve:{session_id}"),
+            InlineKeyboardButton(text="❌ Отменить", callback_data=f"task_reject:{session_id}"),
+        ],
+    ])
+
+
+def task_reapproval_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    """FR-17: material replan triggered — user must re-confirm the
+    revised plan before the executor resumes."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить новый план", callback_data=f"task_reapprove:{session_id}"),
+            InlineKeyboardButton(text="❌ Прервать задачу", callback_data=f"task_reject:{session_id}"),
+        ],
     ])
 
 
@@ -81,11 +117,17 @@ def platform_new_domain_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def platform_domain_keyboard(domain_idx: int, documents: list, is_active: bool) -> InlineKeyboardMarkup:
-    """FR-P16: single-domain detail screen.
+def platform_domain_keyboard(
+    domain_idx: int,
+    documents: list,
+    is_active: bool,
+    mcp_count: int = 0,
+) -> InlineKeyboardMarkup:
+    """FR-P16 + FR-24 single-domain detail screen.
 
     Layout:
       • «✅ Выбран» / «◻️ Выбрать» — single-select activation.
+      • 🔧 Инструменты (N MCP) — opens the MCP registry screen.
       • Per-document row (clickable to view/delete).
       • «🗑 Удалить домен» — full domain delete with all docs.
       • «◀️ К доменам» — back to memory list.
@@ -94,6 +136,10 @@ def platform_domain_keyboard(domain_idx: int, documents: list, is_active: bool) 
     toggle_label = "✅ Выбран для RAG" if is_active else "◻️ Выбрать для RAG"
     buttons.append([InlineKeyboardButton(
         text=toggle_label, callback_data=f"platform_domain_pick:{domain_idx}",
+    )])
+    buttons.append([InlineKeyboardButton(
+        text=f"🔧 Инструменты ({mcp_count} MCP)",
+        callback_data=f"platform_mcp_list:{domain_idx}",
     )])
     for j, doc in enumerate(documents):
         buttons.append([
@@ -115,4 +161,55 @@ def platform_doc_keyboard(domain_idx: int, doc_idx: int) -> InlineKeyboardMarkup
                               callback_data=f"platform_doc_delete:{domain_idx}:{doc_idx}")],
         [InlineKeyboardButton(text="◀️ Назад",
                               callback_data=f"platform_domain_open:{domain_idx}")],
+    ])
+
+
+# ── FR-23/24: MCP management keyboards ──────────────────────────
+
+def platform_mcp_list_keyboard(domain_idx: int, mcps: list) -> InlineKeyboardMarkup:
+    """List of MCPs inside a domain. Tap an entry to view / edit / delete.
+    Tap ➕ to add a new one."""
+    buttons = []
+    for i, m in enumerate(mcps):
+        icon = "🔌" if m.is_builtin else "🌐"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {m.name}",
+            callback_data=f"platform_mcp_view:{domain_idx}:{i}",
+        )])
+    buttons.append([InlineKeyboardButton(
+        text="➕ Добавить MCP",
+        callback_data=f"platform_mcp_new:{domain_idx}",
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="◀️ К домену",
+        callback_data=f"platform_domain_open:{domain_idx}",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def platform_mcp_view_keyboard(domain_idx: int, mcp_idx: int) -> InlineKeyboardMarkup:
+    """Single MCP detail screen — edit / delete / back."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✏️ Редактировать",
+            callback_data=f"platform_mcp_edit:{domain_idx}:{mcp_idx}",
+        )],
+        [InlineKeyboardButton(
+            text="🗑 Удалить",
+            callback_data=f"platform_mcp_delete:{domain_idx}:{mcp_idx}",
+        )],
+        [InlineKeyboardButton(
+            text="◀️ К инструментам",
+            callback_data=f"platform_mcp_list:{domain_idx}",
+        )],
+    ])
+
+
+def platform_mcp_cancel_keyboard(domain_idx: int) -> InlineKeyboardMarkup:
+    """Shown during the add/edit FSM — single Cancel button."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="◀️ Отмена",
+            callback_data=f"platform_mcp_list:{domain_idx}",
+        )],
     ])

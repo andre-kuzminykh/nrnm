@@ -119,8 +119,9 @@ Non-Functional Requirements
 
 | ID    | Requirement                                                                                 |
 | ----- | ------------------------------------------------------------------------------------------- |
-| NFR-4 | Resolver должен использовать порядок exact match → alias match → fuzzy match                |
-| NFR-5 | При указании версии система должна использовать ровно указанную версию; без версии — latest |
+| NFR-4  | Resolver должен использовать порядок exact match → alias match → fuzzy match                                                                 |
+| NFR-5  | При указании версии система должна использовать ровно указанную версию; без версии — latest                                                  |
+| NFR-13 | Если полный контент файла превышает лимит context window, assemble должен запускать map-reduce summarization: чанки → суммари → финальный свод |
 
 ---
 
@@ -222,14 +223,45 @@ Functional Requirements
 | FR-15 | Для каждого этапа система должна иметь expected result и acceptance criteria                                                                         |
 | FR-16 | Если фактический результат не соответствует expected result, система должна пересобрать граф выполнения                                              |
 | FR-17 | Если пересобранный граф materially меняет будущие действия, система должна повторно показать обновлённый план пользователю и получить подтверждение  |
+| FR-18 | План должен генерироваться LLM из текстовой цели как структурированная последовательность шагов с привязкой к инструментам                           |
+| FR-19 | План должен поддерживать параллельные ветви (fan-out/fan-in), последовательные цепочки и условные переходы (conditional edges)                       |
+| FR-20 | Executor должен компилировать план в граф LangGraph и запускать его (parallel + sequential + conditional)                                            |
+| FR-21 | После каждого шага запускается LLM-критик: верификация результата против expected_result, бинарный verdict pass/fail с обоснованием                  |
+| FR-22 | После каждого шага запускается goal-alignment проверка: drift от исходной цели, при превышении порога — триггер replan/redesign                      |
+| FR-23 | Инструменты регистрируются как MCP-записи: `{name, url, token, description, created_at, updated_at}`. Запись можно добавлять, редактировать, удалять |
+| FR-24 | Каждый домен ведёт собственный MCP-реестр. При создании нового домена автоматически бутстрапится дефолтный `web_search` (builtin://serpapi)         |
+| FR-25 | LLM-планировщик получает описания MCP активного домена и использует их как available_tools для привязки шагов                                         |
+| FR-26 | Tool invocation идёт через `services/mcp_client.py`: `builtin://*` → в-процессная реализация, `http(s)://*` → POST на MCP-сервер с bearer token      |
+| FR-27 | RAG-ответ показывает источники как tap-to-original через Telegram `reply_to_message_id`. Никаких `[N]` маркеров, никакого `Источники:` footer          |
 
 Non-Functional Requirements
 
-| ID     | Requirement                                                                                                  |
-| ------ | ------------------------------------------------------------------------------------------------------------ |
-| NFR-10 | Все tool calls и node results должны быть traceable                                                          |
-| NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными                   |
-| NFR-12 | Каждый task run в режиме Задачи должен содержать `plan_preview`, `execution_trace` и `result_summary` (100%) |
+| ID     | Requirement                                                                                                                                                              |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| NFR-10 | Все tool calls и node results должны быть traceable                                                                                                                      |
+| NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными                                                                               |
+| NFR-12 | Каждый task run в режиме Задачи должен содержать `plan_preview`, `execution_trace` и `result_summary` (100%)                                                             |
+| NFR-14 | LLM-компоненты (planner, critic, alignment) должны иметь deterministic stub fallback на случай отсутствия API-ключа / langgraph — для offline dev и CI                   |
+| NFR-15 | Ошибки MCP-клиента (HTTP / network / невалидный response) должны деградировать в `ToolCallResult(status="error")` и триггерить Rule-5 tool_failure replan (FR-16)          |
+
+---
+
+# User Story 4 — LLM-driven planner + LangGraph runtime + critic loop
+
+**Role**: Пользователь, ставящий сложную задачу.
+
+**Story**: Как пользователь, я хочу, чтобы бот сам разбирал мою цель на структурированный план шагов с явными вызовами инструментов, запускал их через настоящий LangGraph (с параллелизмом и условиями), и после каждого шага критически проверял результат и сверялся с целью — чтобы не уходить в дрейф.
+
+**UX**: Пользователь в режиме Задачи пишет цель → бот строит план через LLM → показывает граф (с метками PARALLEL / IF / SEQ) → подтверждение → каждый шаг исполняется + критикуется + сверяется с целью → итоговый ответ либо replan при дрейфе.
+
+#### Use Case UC-4.1 — LLM план + LangGraph + critic loop
+
+* **Given**: пользователь в режиме Задачи, OpenAI API доступен.
+* **When**: ставит цель.
+* **Then**: planner вызывает LLM → возвращает `StructuredPlan` с шагами, `depends_on`, `parallel_groups`, `conditional_edges`. Executor компилирует в `langgraph.StateGraph`. После каждого ноды — critic + alignment. Критик-fail → `replan_signal=critic_failed`. Drift > порога → `replan_signal=goal_drift`. На выходе run несёт plan_preview, execution_trace, result_summary.
+* **Input**: goal text, attached memory.
+* **Output**: structured plan + run state + critic verdicts + alignment scores per step.
+* **State**: LangGraph compiled and invoked; после каждой ноды — verdict trace event.
 
 ---
 
@@ -298,7 +330,11 @@ Telegram input
 * Vector index (Memory retrieval)
 * Redis (session state, queues)
 * LLM provider
-* Web Search integration
+* Web Search integration — SerpAPI (`SERPAPI_API_KEY`). В v1 это
+  единственный провайдер; при отсутствии ключа tool graceful-fallback'ает
+  на детерминированный stub так, чтобы executor-pipeline оставался
+  проходимым в offline dev / CI. HTTP-ошибки SerpAPI маппятся в
+  `status="error"` и триггерят replan (FR-16, Rule 5 trigger #3).
 * PDF Parser service
 * Logging / tracing stack
 
@@ -388,6 +424,19 @@ Graph re-evaluation запускается только если:
 | NFR-10 | `tests/test_us3_execution.py`    |
 | NFR-11 | `tests/test_us3_execution.py`    |
 | NFR-12 | `tests/test_us3_execution.py`    |
+| NFR-13 | `tests/test_us1_memory.py`       |
+| FR-18  | `tests/test_us4_advanced_planner.py` |
+| FR-19  | `tests/test_us4_advanced_planner.py` |
+| FR-20  | `tests/test_us4_advanced_planner.py` |
+| FR-21  | `tests/test_us4_advanced_planner.py` |
+| FR-22  | `tests/test_us4_advanced_planner.py` |
+| NFR-14 | `tests/test_us4_advanced_planner.py` |
+| FR-23  | `tests/test_us5_mcp.py`              |
+| FR-24  | `tests/test_us5_mcp.py`              |
+| FR-25  | `tests/test_us5_mcp.py`              |
+| FR-26  | `tests/test_us5_mcp.py`              |
+| FR-27  | `tests/test_us5_mcp.py`              |
+| NFR-15 | `tests/test_us5_mcp.py`              |
 
 > На момент фиксации v1-спеки многие поведения ещё не реализованы в коде (`services/platform.py` описывает legacy domain-based API из FR-P1..P19). Тесты под ещё не реализованные требования помечены `pytest.skip(...)` с явным `TODO` — они образуют spec-driven roadmap и активируются по мере реализации соответствующих модулей.
 
