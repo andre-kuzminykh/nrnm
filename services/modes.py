@@ -44,6 +44,10 @@ from services import memory as memory_svc
 from services import context_resolver
 from services import tools as tool_layer
 
+# v1.1: LLM planner + LangGraph runtime live in dedicated modules.
+# Imported lazily inside start_task / run_advanced so older test paths
+# that monkeypatch modes don't have to install langgraph.
+
 
 AVAILABLE_MODES = ("chat", "task")  # Rule 2
 
@@ -144,6 +148,11 @@ class TaskSession:
     plan: PlanDraft
     state: str                       # mirrors TaskRun.state up to approval
     run: TaskRun | None = None
+    # v1.1 — StructuredPlan from llm_planner.build_plan(). Held alongside
+    # the legacy PlanDraft.graph so the US-3 injection-based tests keep
+    # working AND the new LangGraph runtime has something to compile.
+    structured_plan: object | None = None
+    advanced_state: object | None = None  # graph_runtime.GraphState after run
 
 
 # ── Storage ──────────────────────────────────────────────────────
@@ -249,7 +258,28 @@ def start_task(
     plan_id = uuid.uuid4().hex[:12]
     attached = _resolve_attached_memory(tg_id, goal)
     graph = _build_graph(goal, attached)
-    human = _render_plan_preview(goal, graph)
+
+    # v1.1 — also build a StructuredPlan via the LLM planner.
+    # The legacy PlanGraph above stays as-is so the US-3 injection
+    # tests (inject_failure_on=stage-1) keep matching node ids.
+    structured = None
+    try:
+        from services import llm_planner
+
+        structured = llm_planner.build_plan(
+            goal,
+            available_tools=("web_search", "pdf_parser"),
+            attached_memory=attached,
+        )
+    except Exception:  # noqa: BLE001
+        structured = None
+
+    # Human-readable preview prefers the structured plan when available
+    # because it carries dependency / parallelism / conditional info.
+    if structured is not None:
+        human = _render_structured_preview(structured)
+    else:
+        human = _render_plan_preview(goal, graph)
 
     plan = PlanDraft(
         plan_id=plan_id,
@@ -268,9 +298,96 @@ def start_task(
         goal=goal,
         plan=plan,
         state="awaiting_approval",
+        structured_plan=structured,
     )
     _SESSIONS[session_id] = session
     return session
+
+
+def run_advanced(session_id: str):
+    """v1.1 entry point — compile the StructuredPlan via graph_runtime
+    and execute. Returns the final `GraphState` (results + trace +
+    replan_signal). Caller must have approved the plan first.
+
+    This is the LangGraph + critic + alignment path. The legacy
+    `execute()` (with inject_* hooks) is still available for backward
+    compatibility with US-3 tests; the bot handler picks this path
+    when `session.structured_plan` is set.
+    """
+    session = _SESSIONS[session_id]
+    if session.state not in ("approved", "executing"):
+        raise ApprovalRequiredError(
+            f"Session {session_id!r} not approved (state={session.state!r})",
+        )
+    if session.structured_plan is None:
+        raise RuntimeError("session has no structured plan; use execute() instead")
+
+    from services import graph_runtime
+
+    session.state = "executing"
+    compiled = graph_runtime.compile_plan(session.structured_plan)
+    final_state = graph_runtime.run(compiled, goal=session.goal)
+    session.advanced_state = final_state
+
+    # Mirror the result into a TaskRun so NFR-12 artefacts are uniform.
+    run = _ensure_run(session_id)
+    run.execution_trace = [
+        TraceEvent(kind=t.kind, node_id=t.node_id, payload=dict(t.payload))
+        for t in final_state.trace
+    ]
+    run.completed_steps = list(final_state.completed_step_ids)
+    if final_state.replan_signal is not None:
+        run.state = "awaiting_approval" if final_state.replan_signal == "goal_drift" else "failed"
+        session.state = run.state
+        run.result_summary = {
+            "goal": session.goal,
+            "outcome": "replan",
+            "reason": final_state.replan_signal,
+            "backend": compiled.backend,
+        }
+    else:
+        run.state = "done"
+        session.state = "done"
+        run.result_summary = {
+            "goal": session.goal,
+            "outcome": "success",
+            "completed_stages": list(final_state.completed_step_ids),
+            "backend": compiled.backend,
+        }
+    return final_state
+
+
+def _render_structured_preview(plan) -> str:
+    """Render a StructuredPlan as a human-readable preview that hides
+    internal IDs while still showing parallelism and dependencies (NFR-8).
+
+    Uses bullet markers:
+      • SEQ — runs after a previous step
+      ‖ PAR — runs in parallel with siblings
+      ↳ IF  — conditional branch target
+    """
+    parallel_ids: set[str] = set()
+    for group in plan.parallel_groups:
+        parallel_ids.update(group)
+
+    lines = [f"План для цели: {plan.goal}", ""]
+    for idx, step in enumerate(plan.steps, start=1):
+        marker = "‖" if step.id in parallel_ids else ("→" if step.depends_on else "▸")
+        tool_label = f" [{step.tool}]" if step.tool else ""
+        lines.append(f"{idx}. {marker} {step.description}{tool_label}")
+        lines.append(f"   ожидание: {step.expected_result}")
+    if plan.parallel_groups:
+        lines.append("")
+        lines.append(
+            "‖ — параллельные ветви, выполняются одновременно"
+        )
+    if plan.conditional_edges:
+        lines.append(
+            "↳ — условные переходы (если результат пустой → fallback ветвь)"
+        )
+    lines.append("")
+    lines.append("Подтвердите план, чтобы запустить выполнение.")
+    return "\n".join(lines)
 
 
 def get_session(session_id: str) -> TaskSession:

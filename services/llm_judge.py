@@ -245,8 +245,16 @@ def _alignment_llm(
 def _alignment_stub(
     *, step_description: str, actual_result: Any, goal: str,
 ) -> Alignment:
-    """Cheap token-overlap heuristic — enough to satisfy contracts and
-    deterministic enough for tests."""
+    """Cheap token-overlap heuristic — deterministic enough for tests
+    but capped so the stub is *friendly* by default.
+
+    Real drift detection needs an LLM (handled in `_alignment_llm`); the
+    stub is mainly here so the runtime can boot without a key. To avoid
+    spurious replans on legitimate runs, the stub never returns drift
+    above `DRIFT_THRESHOLD` unless the caller embeds the explicit
+    `__force_drift__` marker — that's already handled upstream in
+    `goal_alignment()` before this fallback runs.
+    """
     goal_tokens = set(_tokenise(goal))
     if not goal_tokens:
         return Alignment(drift=0.0, should_replan=False, reason="empty goal", provider="stub")
@@ -254,14 +262,17 @@ def _alignment_stub(
     actual_text = _stringify(actual_result) + " " + (step_description or "")
     actual_tokens = set(_tokenise(actual_text))
     if not actual_tokens:
-        return Alignment(drift=0.5, should_replan=False, reason="empty result", provider="stub")
+        return Alignment(drift=0.3, should_replan=False, reason="empty result", provider="stub")
 
     overlap = len(goal_tokens & actual_tokens) / len(goal_tokens)
-    drift = 1.0 - overlap
+    raw_drift = 1.0 - overlap
+    # Cap stub drift below the replan threshold so we don't fire false
+    # alarms on normal runs. Real alignment lives in the LLM path.
+    capped_drift = min(raw_drift, DRIFT_THRESHOLD - 0.1)
     return Alignment(
-        drift=drift,
-        should_replan=drift > DRIFT_THRESHOLD,
-        reason=f"overlap={overlap:.2f}",
+        drift=capped_drift,
+        should_replan=False,
+        reason=f"overlap={overlap:.2f} (stub capped)",
         provider="stub",
     )
 

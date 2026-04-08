@@ -30,8 +30,9 @@ sync, and LangGraph's `compiled.invoke()` works fine in either mode.
 from __future__ import annotations
 
 import logging
+import operator
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Annotated, Any, Callable, TypedDict
 
 from services import tools as tool_layer
 from services import llm_judge
@@ -213,21 +214,29 @@ def _execute_step(step: PlanStep, state: GraphState) -> Any:
 # ── LangGraph backend ────────────────────────────────────────────
 
 
+class _LGState(TypedDict, total=False):
+    """LangGraph state schema. Lives at module level so `get_type_hints`
+    can resolve `Annotated` / reducer references during compilation."""
+    goal: str
+    results: Annotated[dict, "_dict_merge"]
+    trace: Annotated[list, operator.add]
+    replan_signal: str
+    completed_step_ids: Annotated[list, operator.add]
+
+
 def _compile_langgraph(plan: StructuredPlan) -> CompiledPlan:
-    """Build a real `langgraph.StateGraph` from the StructuredPlan."""
+    """Build a real `langgraph.StateGraph` from the StructuredPlan.
+
+    Parallel branches: when two nodes share a parent and don't depend on
+    each other, LangGraph fans out automatically. We don't need to wire
+    `parallel_groups` explicitly — the dependency edges already encode it.
+    """
     from langgraph.graph import StateGraph, START, END
 
-    # LangGraph needs a state schema. We use a TypedDict-shaped reducer
-    # so it can merge updates from parallel branches without losing data.
-    from typing import TypedDict, Annotated
-    import operator
-
-    class _LGState(TypedDict, total=False):
-        goal: str
-        results: Annotated[dict, _dict_merge]
-        trace: Annotated[list, operator.add]
-        replan_signal: str | None
-        completed_step_ids: Annotated[list, operator.add]
+    # Replace the placeholder string reducer with the real callable
+    # right before instantiation (LangGraph evaluates it after
+    # get_type_hints during _add_schema).
+    _LGState.__annotations__["results"] = Annotated[dict, _dict_merge]
 
     sg = StateGraph(_LGState)
 

@@ -840,54 +840,107 @@ def _extract_text(data: bytes, filename: str) -> str:
 # ── FR-11 / FR-17 / NFR-9: task approval callbacks ──────────────
 
 def _render_run_summary(run) -> str:
-    """Compact human-readable summary of a finished / partial task run,
-    covering plan preview + stages walked + trace count + final outcome
-    (NFR-12 artefacts in one message)."""
+    """Compact human-readable summary of a finished / partial task run.
+
+    Covers NFR-12 artefacts (plan preview + stages walked + trace count
+    + outcome) and, when the LangGraph runtime path was used, surfaces
+    per-step critic verdicts and alignment drift scores from the trace
+    so the user sees WHY each step passed or failed (FR-21, FR-22).
+    """
+    summary = run.result_summary or {}
+    outcome = summary.get("outcome", "—")
+    reason = summary.get("reason", "")
+    backend = summary.get("backend", "")
+
+    # Legacy stages list (US-3 path).
     stage_lines = [
         f"  • {s.node_id}: {'✅' if s.status == 'pass' else '❌'}"
         for s in run.stages
     ]
-    summary = run.result_summary or {}
-    outcome = summary.get("outcome", "—")
-    reason = summary.get("reason", "")
-    reason_line = f"\n<b>Причина:</b> {_html.escape(str(reason))}" if reason else ""
-    stages_block = "\n".join(stage_lines) if stage_lines else "  • (нет этапов)"
-    return (
-        f"<b>Этапы:</b>\n{stages_block}\n\n"
-        f"<b>Trace events:</b> {len(run.execution_trace)}\n"
-        f"<b>Результат:</b> {_html.escape(str(outcome))}{reason_line}"
-    )
+
+    # Advanced runtime: extract per-step verdicts from the trace.
+    critic_lines: list[str] = []
+    drift_lines: list[str] = []
+    for ev in run.execution_trace:
+        if ev.kind == "critic":
+            mark = "✅" if ev.payload.get("verdict") == "pass" else "❌"
+            critic_lines.append(
+                f"  {mark} {ev.node_id}: {_html.escape(str(ev.payload.get('reason', ''))[:80])}"
+            )
+        elif ev.kind == "alignment":
+            drift = float(ev.payload.get("drift", 0.0))
+            warn = "⚠️" if ev.payload.get("should_replan") else "·"
+            drift_lines.append(
+                f"  {warn} {ev.node_id}: drift={drift:.2f}"
+            )
+
+    parts: list[str] = []
+    if backend:
+        parts.append(f"<b>Runtime:</b> <code>{_html.escape(backend)}</code>")
+    if stage_lines:
+        parts.append("<b>Этапы:</b>\n" + "\n".join(stage_lines))
+    if critic_lines:
+        parts.append("<b>Critic verdicts:</b>\n" + "\n".join(critic_lines[:8]))
+    if drift_lines:
+        parts.append("<b>Goal alignment:</b>\n" + "\n".join(drift_lines[:8]))
+    parts.append(f"<b>Trace events:</b> {len(run.execution_trace)}")
+    parts.append(f"<b>Результат:</b> {_html.escape(str(outcome))}")
+    if reason:
+        parts.append(f"<b>Причина:</b> {_html.escape(str(reason))}")
+    return "\n\n".join(parts)
 
 
 @router.callback_query(F.data.startswith("task_approve:"))
 async def on_task_approve(callback: CallbackQuery):
+    """FR-11 approval gate. Prefers the v1.1 LangGraph runtime
+    (`run_advanced`) when the session has a StructuredPlan; falls back
+    to the legacy `execute()` for sessions that don't (e.g. when the
+    LLM planner failed and only the legacy stub graph is available)."""
     session_id = callback.data.split(":", 1)[1]
     try:
-        modes_svc.approve_plan(session_id)
-        run = modes_svc.execute(session_id)
+        session = modes_svc.get_session(session_id)
     except KeyError:
         await callback.answer("Сессия не найдена или уже завершена", show_alert=True)
         return
+
+    try:
+        modes_svc.approve_plan(session_id)
+        if session.structured_plan is not None:
+            modes_svc.run_advanced(session_id)
+            run = session.run
+        else:
+            run = modes_svc.execute(session_id)
     except modes_svc.ApprovalRequiredError as e:
         await callback.answer(str(e), show_alert=True)
         return
 
-    if run.state == "awaiting_approval" and run.revised_plan is not None:
-        # FR-17: material diff — show revised plan and ask again
-        revised = run.revised_plan
+    # FR-17 / FR-22: material replan or goal drift — re-confirm
+    if run.state == "awaiting_approval":
+        revised_block = ""
+        if run.revised_plan is not None:
+            revised_block = (
+                f"<b>Причина:</b> {_html.escape(run.revised_plan.reason)}\n"
+                f"<b>Material diff:</b> да\n\n"
+                f"<pre>{_html.escape(run.revised_plan.human_readable)}</pre>"
+            )
+        else:
+            # Came from run_advanced -> goal_drift
+            reason = (run.result_summary or {}).get("reason", "goal_drift")
+            revised_block = (
+                f"<b>Причина:</b> {_html.escape(str(reason))}\n"
+                "Goal alignment просела ниже порога — план надо переделать."
+            )
         await callback.message.answer(
-            "🔁 <b>План перестроен</b>\n\n"
-            f"<b>Причина:</b> {_html.escape(revised.reason)}\n"
-            f"<b>Material diff:</b> да\n\n"
-            f"<pre>{_html.escape(revised.human_readable)}</pre>",
+            "🔁 <b>План требует пересборки</b>\n\n" + revised_block,
             reply_markup=task_reapproval_keyboard(session_id),
             parse_mode=ParseMode.HTML,
         )
-        await callback.answer("План перестроен, требуется повторное подтверждение")
+        await callback.answer("Требуется повторное подтверждение")
         return
 
+    icon = "✅" if run.state == "done" else "❌"
     await callback.message.answer(
-        f"✅ <b>Задача выполнена</b>\n\n{_render_run_summary(run)}",
+        f"{icon} <b>Задача завершена</b>\n\n{_render_run_summary(run)}",
         parse_mode=ParseMode.HTML,
     )
     await callback.answer("Готово")
