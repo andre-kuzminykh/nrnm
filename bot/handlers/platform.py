@@ -22,6 +22,8 @@ import asyncio
 import html as _html
 import io
 import logging
+import queue as _queue
+import time as _time
 import uuid
 from dataclasses import dataclass
 
@@ -1095,6 +1097,192 @@ def _extract_text(data: bytes, filename: str) -> str:
         return ""
 
 
+# ── Live task progress rendering ────────────────────────────────
+
+
+# Max number of progress lines we keep before trimming the oldest.
+# Telegram max message length is 4096 chars; with ~60 chars per line
+# this leaves room for the header and the final summary.
+_MAX_PROGRESS_LINES = 40
+
+
+def _format_progress_event(kind: str, node_id: str | None, payload: dict) -> str | None:
+    """Render a single runtime progress event as a Telegram HTML line.
+
+    Return None for events we don't want to surface (runtime_done is
+    handled separately by the final summary).
+    """
+    if kind == "planner_done":
+        return (
+            f"📋 <b>Планировщик:</b> {payload.get('steps', '?')} шагов, "
+            f"{payload.get('parallel_groups', 0)} параллель, "
+            f"{payload.get('conditional_edges', 0)} условных | "
+            f"backend=<code>{payload.get('backend', '?')}</code>"
+        )
+    if kind == "step_start":
+        tool = payload.get("tool")
+        tool_tag = f" 🔧 <code>{_html.escape(tool)}</code>" if tool else " 💡 reasoning"
+        desc = (payload.get("description") or "")[:90]
+        return f"▸ <b>{_html.escape(node_id or '?')}</b>: {_html.escape(desc)}{tool_tag}"
+    if kind == "tool_call_done":
+        status = payload.get("status")
+        if status == "ok":
+            hits = payload.get("hits")
+            hits_tag = f" ({hits} hits)" if hits is not None else ""
+            provider = payload.get("provider") or "?"
+            return f"   ✅ tool <code>{_html.escape(str(payload.get('tool', '?')))}</code> via <i>{_html.escape(str(provider))}</i>{hits_tag}"
+        err = (payload.get("error") or "")[:80]
+        attempt = payload.get("attempt", 1)
+        return f"   ⚠️ tool error (attempt {attempt}): <i>{_html.escape(err)}</i>"
+    if kind == "tool_retry":
+        attempt = payload.get("attempt", "?")
+        m = payload.get("max", "?")
+        backoff = payload.get("backoff_sec", 0)
+        return f"   🔄 retry {attempt}/{m} (wait {backoff:.1f}s)"
+    if kind == "critic":
+        verdict = payload.get("verdict", "?")
+        icon = "✅" if verdict == "pass" else "❌"
+        reason = (payload.get("reason") or "")[:120]
+        return f"   🧐 critic: {icon} {_html.escape(verdict)} — <i>{_html.escape(reason)}</i>"
+    if kind == "process_critic":
+        action = payload.get("action", "?")
+        icon = "▶️" if action == "continue" else "🛑"
+        reason = (payload.get("reason") or "")[:100]
+        return f"   🧠 process critic: {icon} <b>{_html.escape(action)}</b> — <i>{_html.escape(reason)}</i>"
+    if kind == "alignment":
+        drift = float(payload.get("drift", 0))
+        icon = "⚠️" if payload.get("should_replan") else "·"
+        return f"   🎯 alignment: {icon} drift={drift:.2f}"
+    if kind == "synthesising":
+        prior = payload.get("prior_count", 0)
+        return f"   💡 synthesising from {prior} prior steps…"
+    if kind == "synthesis_done":
+        chars = payload.get("chars", 0)
+        return f"   ✅ synthesis: {chars} chars"
+    if kind == "step_done":
+        return "   ✅ <b>done</b>"
+    if kind == "step_soft_pass":
+        concern = (payload.get("concern") or "")[:100]
+        return f"   🟡 soft-pass (concern: <i>{_html.escape(concern)}</i>)"
+    if kind == "step_abort":
+        reason = (payload.get("reason") or "")[:100]
+        return f"   🛑 <b>abort</b>: <i>{_html.escape(reason)}</i>"
+    return None
+
+
+async def _run_with_live_progress(
+    session_id: str,
+    status_message: Message,
+    advanced: bool,
+) -> "modes_svc.TaskRun | None":
+    """Run `run_advanced` (or legacy `execute`) in a worker thread while
+    editing `status_message` with a live progress log.
+
+    Architecture:
+    - sync progress events go through a `queue.Queue` (thread-safe).
+    - async loop polls the queue, batches events, and edits the
+      status message at most once every 1.5s (Telegram edit rate).
+    - when the worker thread finishes (done or exception), we do a
+      final drain + let the caller render the summary.
+    """
+    progress_q: _queue.Queue = _queue.Queue()
+
+    def _push(kind: str, node_id: str | None, payload: dict) -> None:
+        try:
+            progress_q.put_nowait((kind, node_id, payload))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Kick off the worker thread
+    if advanced:
+        task = asyncio.create_task(
+            asyncio.to_thread(modes_svc.run_advanced, session_id, _push)
+        )
+    else:
+        task = asyncio.create_task(
+            asyncio.to_thread(modes_svc.execute, session_id)
+        )
+
+    header = "🎯 <b>Выполнение плана</b>\n"
+    lines: list[str] = []
+    last_edit = 0.0
+    min_edit_interval = 1.5  # seconds — Telegram rate limit protection
+
+    async def _render() -> None:
+        """Build the current progress text and edit the status message."""
+        visible = lines[-_MAX_PROGRESS_LINES:]
+        body = "\n".join(visible) if visible else "<i>подожди, запускаю…</i>"
+        text = header + "\n" + body
+        # Telegram max ~4096 chars. Leave safety margin.
+        if len(text) > 3800:
+            text = text[:3800] + "\n<i>…(обрезано)</i>"
+        try:
+            await status_message.edit_text(text, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest as e:
+            # "message is not modified" fires when content hasn't
+            # changed — ignore. Any other bad request: log + swallow.
+            if "not modified" not in str(e).lower():
+                logger.debug("status edit: %s", e)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("status edit unexpected: %s", exc)
+
+    # Main drain loop — runs until the worker task finishes
+    while not task.done():
+        # Drain any pending events
+        changed = False
+        while True:
+            try:
+                kind, node_id, payload = progress_q.get_nowait()
+            except _queue.Empty:
+                break
+            line = _format_progress_event(kind, node_id, payload)
+            if line:
+                lines.append(line)
+                changed = True
+
+        now = _time.monotonic()
+        if changed and (now - last_edit) >= min_edit_interval:
+            await _render()
+            last_edit = now
+
+        await asyncio.sleep(0.3)
+
+    # Final drain once the worker is done
+    while True:
+        try:
+            kind, node_id, payload = progress_q.get_nowait()
+        except _queue.Empty:
+            break
+        line = _format_progress_event(kind, node_id, payload)
+        if line:
+            lines.append(line)
+
+    # Show the last progress snapshot once more so nothing is lost
+    if lines:
+        await _render()
+
+    # Await the task — re-raises any exception from the worker
+    try:
+        await task
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("task worker failed")
+        try:
+            await status_message.edit_text(
+                f"{header}\n\n❌ <b>Ошибка:</b> <code>{_html.escape(str(exc)[:500])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    # Return the TaskRun from the session
+    try:
+        session = modes_svc.get_session(session_id)
+        return session.run
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ── FR-11 / FR-17 / NFR-9: task approval callbacks ──────────────
 
 def _extract_synthesis_text(run) -> str | None:
@@ -1199,23 +1387,24 @@ def _render_run_summary(run) -> str:
 
 @router.callback_query(F.data.startswith("task_approve:"))
 async def on_task_approve(callback: CallbackQuery):
-    """FR-11 approval gate. Prefers the v1.1 LangGraph runtime
-    (`run_advanced`) when the session has a StructuredPlan; falls back
-    to the legacy `execute()` for sessions that don't.
+    """FR-11 approval gate with **live progress rendering**.
 
-    UX notes:
-    - **ACK immediately** (`callback.answer()` without args) so the
-      Telegram spinner dismisses before the 15-second query timeout.
-      Real runs take 15-30s (LLM planner + SerpAPI + per-step critic
-      + alignment) and without this ACK every tap ends in
-      `TelegramBadRequest: query is too old`.
-    - **Disable the keyboard** right after ACK so the user can't
-      double-tap and spin up a second parallel pipeline (that's twice
-      the OpenAI + SerpAPI bill for the same goal).
-    - **Offload the sync pipeline to a threadpool** via
-      `asyncio.to_thread` so the event loop stays responsive — the
-      /health endpoint, other callbacks, and polling all keep working
-      while the task runs.
+    The pipeline is synchronous (OpenAI + SerpAPI via httpx.Client),
+    so we offload it to a worker thread and poll a `queue.Queue` of
+    progress events. The status message gets edited at most once
+    every 1.5s with the latest progress snapshot (Telegram edit
+    rate limit). When the worker finishes we replace the progress
+    log with the final summary (synthesis + critic verdicts +
+    alignment drifts).
+
+    UX guarantees:
+    - `callback.answer()` fires in the first millisecond so the
+      Telegram spinner dismisses and the 15s query timeout doesn't
+      bite even for 30s+ runs.
+    - `edit_reply_markup(None)` kills the approve keyboard so a
+      second tap can't start a duplicate pipeline.
+    - `asyncio.to_thread` keeps the event loop responsive —
+      `/health` and other callbacks keep working during the run.
     """
     await callback.answer()  # dismiss spinner before 15s timeout
 
@@ -1230,48 +1419,31 @@ async def on_task_approve(callback: CallbackQuery):
         return
 
     # Kill the approval keyboard so a second tap doesn't kick off a
-    # duplicate run. Ignored if Telegram already accepted the first
-    # tap's state mutation.
+    # duplicate run.
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
         pass
 
     status = await callback.message.answer(
-        "⏳ <b>Выполняю план…</b>\n"
-        "<i>Обычно 15–30 секунд: planner → tool calls → per-step critic → goal alignment.</i>",
+        "🎯 <b>Выполнение плана</b>\n\n<i>запускаю…</i>",
         parse_mode=ParseMode.HTML,
     )
 
     try:
         modes_svc.approve_plan(session_id)
-        if session.structured_plan is not None:
-            # Offload the blocking LLM/HTTP pipeline so the event loop
-            # keeps serving /health and other updates.
-            await asyncio.to_thread(modes_svc.run_advanced, session_id)
-            run = session.run
-        else:
-            run = await asyncio.to_thread(modes_svc.execute, session_id)
     except modes_svc.ApprovalRequiredError as e:
         await status.edit_text(
             f"❌ <i>{_html.escape(str(e))}</i>",
             parse_mode=ParseMode.HTML,
         )
         return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("task_approve pipeline failed")
-        await status.edit_text(
-            f"❌ Неожиданная ошибка:\n<code>{_html.escape(str(exc)[:400])}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
+    # Run with live progress — uses queue.Queue + rate-limited edits.
+    advanced = session.structured_plan is not None
+    run = await _run_with_live_progress(session_id, status, advanced=advanced)
     if run is None:
-        await status.edit_text(
-            "❌ Пайплайн не вернул run — проверь логи.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+        return  # error already rendered inside the helper
 
     # FR-17 / FR-22: material replan or goal drift — re-confirm
     if run.state == "awaiting_approval":
@@ -1295,10 +1467,17 @@ async def on_task_approve(callback: CallbackQuery):
         return
 
     icon = "✅" if run.state == "done" else "❌"
-    await status.edit_text(
-        f"{icon} <b>Задача завершена</b>\n\n{_render_run_summary(run)}",
-        parse_mode=ParseMode.HTML,
-    )
+    final_text = f"{icon} <b>Задача завершена</b>\n\n{_render_run_summary(run)}"
+    # Telegram hard limit 4096; we already trim in _render_run_summary
+    # but the header adds ~30 chars — clip to 4000 just in case.
+    if len(final_text) > 4000:
+        final_text = final_text[:4000] + "\n<i>…(обрезано)</i>"
+    try:
+        await status.edit_text(final_text, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest as e:
+        logger.warning("final edit failed: %s", e)
+        # Fall back to sending as a new message
+        await callback.message.answer(final_text, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data.startswith("task_reapprove:"))

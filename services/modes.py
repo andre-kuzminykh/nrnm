@@ -323,10 +323,16 @@ def start_task(
     return session
 
 
-def run_advanced(session_id: str):
+def run_advanced(session_id: str, progress_callback=None):
     """v1.1 entry point — compile the StructuredPlan via graph_runtime
     and execute. Returns the final `GraphState` (results + trace +
     replan_signal). Caller must have approved the plan first.
+
+    `progress_callback(kind, node_id, payload)` is forwarded down to
+    the runtime so the bot handler can render live progress in the
+    Telegram status message. It is invoked from inside the worker
+    thread and MUST be thread-safe — the bot uses a `queue.Queue`
+    here and polls it from the async loop.
 
     This is the LangGraph + critic + alignment path. The legacy
     `execute()` (with inject_* hooks) is still available for backward
@@ -358,6 +364,7 @@ def run_advanced(session_id: str):
         session.structured_plan,
         tg_id=session.tg_id,
         active_domain=active_domain,
+        progress_callback=progress_callback,
     )
     final_state = graph_runtime.run(compiled, goal=session.goal)
     session.advanced_state = final_state
