@@ -4,19 +4,15 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # NOTE: `${HEALTH_PORT}` без `:-default` — legacy docker-compose v1
+    # (такой живёт в Cloud Shell) не поддерживает default-синтаксис.
+    # .env ОБЯЗАН содержать `HEALTH_PORT=...` (есть в .env.example).
     ports:
-      - "${HEALTH_PORT:-8003}:${HEALTH_PORT:-8003}"
+      - "${HEALTH_PORT}:${HEALTH_PORT}"
     volumes:
       - bot-data:/app/data-persist
     healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - |
-          import os, urllib.request
-          port = os.environ.get("HEALTH_PORT", "8003")
-          urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3).read()
+      test: ["CMD", "python", "-c", "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('HEALTH_PORT','8003')+'/health',timeout=3).read()"]
       interval: 30s
       timeout: 5s
       retries: 3
