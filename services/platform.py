@@ -280,3 +280,32 @@ def delete_document(tg_id: int, domain_name: str, doc_id: str) -> bool:
         _persist()
         return True
     return False
+
+
+# ── v1 re-exports ────────────────────────────────────────────────
+#
+# Tests import as `import services.platform as svc` and expect the v1
+# Memory Service + context resolver surface on the same module. Keep
+# these imports at the bottom so there's no circular init ordering.
+
+from services.memory import (  # noqa: E402
+    MemoryObject,
+    MemoryObjectVersion,
+    create_memory_object,
+    update_memory_object,
+    list_versions,
+    read_memory_object,
+    set_alias,
+    set_object_content,
+    get_object_content,
+    list_memory_objects,
+)
+from services.context_resolver import (  # noqa: E402
+    ContextRef,
+    ResolvedRef,
+    AssembledContext,
+    AssembledContextObject,
+    parse_context_refs,
+    resolve_context_ref,
+    assemble_full_context,
+)

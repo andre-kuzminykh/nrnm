@@ -38,6 +38,24 @@ def _isolated_platform_store(monkeypatch):
         platform_svc._PLATFORM_FILE = os.path.join(tmp, "platform_store.pkl")
     except Exception:  # noqa: BLE001
         pass
+
+    # Wipe v1 stores (memory objects, aliases, idempotency, object content).
+    try:
+        import services.memory as memory_svc  # noqa: WPS433
+
+        memory_svc._reset_stores()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Wipe v1 modes state (task sessions, traces).
+    try:
+        import services.modes as modes_svc  # noqa: WPS433
+
+        if hasattr(modes_svc, "_reset_state"):
+            modes_svc._reset_state()
+    except Exception:  # noqa: BLE001
+        pass
+
     yield
 
 
