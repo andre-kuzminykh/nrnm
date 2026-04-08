@@ -1097,33 +1097,75 @@ def _extract_text(data: bytes, filename: str) -> str:
 
 # ── FR-11 / FR-17 / NFR-9: task approval callbacks ──────────────
 
+def _extract_synthesis_text(run) -> str | None:
+    """Find the final synthesis text in the run's results dict.
+
+    Walks the session's advanced_state (FR-20 GraphState) and looks
+    for the last step whose output has a `text` key — that's the
+    convention our LLM-backed synthesis uses in _synthesize_step.
+    Falls back to any result dict that carries `text`, in whatever
+    order they appear, so partial runs still surface something
+    useful.
+    """
+    session = None
+    try:
+        for s in modes_svc._SESSIONS.values():
+            if s.run is run:
+                session = s
+                break
+    except Exception:  # noqa: BLE001
+        return None
+    if session is None or session.advanced_state is None:
+        return None
+    results = session.advanced_state.results or {}
+    # Prefer the LAST step's output if it has text
+    for sid in reversed(list(results.keys())):
+        val = results.get(sid)
+        if isinstance(val, dict) and isinstance(val.get("text"), str):
+            return val["text"]
+    return None
+
+
 def _render_run_summary(run) -> str:
     """Compact human-readable summary of a finished / partial task run.
 
-    Covers NFR-12 artefacts (plan preview + stages walked + trace count
-    + outcome) and, when the LangGraph runtime path was used, surfaces
-    per-step critic verdicts and alignment drift scores from the trace
-    so the user sees WHY each step passed or failed (FR-21, FR-22).
+    Two-section layout:
+    1. **The actual answer** — pulled from the last synthesis step
+       (the one _synthesize_step wrote). This is what the user asked
+       for; it goes first.
+    2. **Diagnostic block** — critic verdicts, goal alignment drifts,
+       trace count, backend, outcome. Collapsed after the answer so
+       the user can inspect or ignore it.
     """
     summary = run.result_summary or {}
     outcome = summary.get("outcome", "—")
     reason = summary.get("reason", "")
     backend = summary.get("backend", "")
 
-    # Legacy stages list (US-3 path).
+    parts: list[str] = []
+
+    # 1. Actual synthesised answer — THIS is what the user wanted.
+    synthesis = _extract_synthesis_text(run)
+    if synthesis:
+        # Telegram HTML max message length is 4096 chars; leave room
+        # for the diagnostic footer.
+        if len(synthesis) > 3500:
+            synthesis = synthesis[:3500] + "\n\n<i>…(обрезано, полный ответ в логах)</i>"
+        parts.append(f"📝 <b>Ответ:</b>\n\n{_html.escape(synthesis)}")
+
+    # 2. Diagnostic footer
     stage_lines = [
         f"  • {s.node_id}: {'✅' if s.status == 'pass' else '❌'}"
         for s in run.stages
     ]
 
-    # Advanced runtime: extract per-step verdicts from the trace.
     critic_lines: list[str] = []
     drift_lines: list[str] = []
     for ev in run.execution_trace:
         if ev.kind == "critic":
             mark = "✅" if ev.payload.get("verdict") == "pass" else "❌"
             critic_lines.append(
-                f"  {mark} {ev.node_id}: {_html.escape(str(ev.payload.get('reason', ''))[:80])}"
+                f"  {mark} {ev.node_id}: {_html.escape(str(ev.payload.get('reason', ''))[:120])}"
             )
         elif ev.kind == "alignment":
             drift = float(ev.payload.get("drift", 0.0))
@@ -1132,19 +1174,26 @@ def _render_run_summary(run) -> str:
                 f"  {warn} {ev.node_id}: drift={drift:.2f}"
             )
 
-    parts: list[str] = []
+    diag: list[str] = []
     if backend:
-        parts.append(f"<b>Runtime:</b> <code>{_html.escape(backend)}</code>")
+        diag.append(f"<b>Runtime:</b> <code>{_html.escape(backend)}</code>")
     if stage_lines:
-        parts.append("<b>Этапы:</b>\n" + "\n".join(stage_lines))
+        diag.append("<b>Этапы:</b>\n" + "\n".join(stage_lines))
     if critic_lines:
-        parts.append("<b>Critic verdicts:</b>\n" + "\n".join(critic_lines[:8]))
+        diag.append("<b>Critic verdicts:</b>\n" + "\n".join(critic_lines[:8]))
     if drift_lines:
-        parts.append("<b>Goal alignment:</b>\n" + "\n".join(drift_lines[:8]))
-    parts.append(f"<b>Trace events:</b> {len(run.execution_trace)}")
-    parts.append(f"<b>Результат:</b> {_html.escape(str(outcome))}")
+        diag.append("<b>Goal alignment:</b>\n" + "\n".join(drift_lines[:8]))
+    diag.append(f"<b>Trace events:</b> {len(run.execution_trace)}")
+    diag.append(f"<b>Результат:</b> {_html.escape(str(outcome))}")
     if reason:
-        parts.append(f"<b>Причина:</b> {_html.escape(str(reason))}")
+        diag.append(f"<b>Причина:</b> {_html.escape(str(reason))}")
+
+    if parts:
+        # Collapse the diagnostics behind a separator under the answer.
+        parts.append("━━━━━━━━━━━━━━\n<i>Диагностика:</i>\n\n" + "\n\n".join(diag))
+    else:
+        # Nothing synthesised — diagnostics IS the message.
+        parts.extend(diag)
     return "\n\n".join(parts)
 
 

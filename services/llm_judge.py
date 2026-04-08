@@ -96,15 +96,25 @@ def critic(
 
 
 _CRITIC_PROMPT = """\
-You are a strict reviewer. Given a step, its expected result, the
-actual result, and the original goal — decide whether the step passed.
+You are a lenient-but-honest reviewer. Your job: decide whether the
+actual result of a plan step plausibly contributes toward the user's
+goal — not whether it's perfect or complete.
 
 Return JSON ONLY, schema:
 {"verdict": "pass" | "fail", "reason": "...", "confidence": 0.0..1.0}
 
-Pass = actual result satisfies expected and contributes to the goal.
-Fail = result is empty / wrong / off-topic / clearly insufficient.
-Be strict; when unsure → fail.
+DEFAULT TO PASS. A messy-but-relevant web_search result with real
+hits PASSES. A plausible pdf extraction PASSES. A partially-filled
+table PASSES. The synthesis / final step can always polish incomplete
+data downstream.
+
+FAIL only when the result is one of:
+- empty / null / zero hits
+- an error message or exception trace
+- completely off-topic (doesn't mention the goal at all)
+- explicitly wrong or contradictory to the acceptance_criteria
+
+When in doubt → pass. Verbose but relevant > clean but empty.
 """
 
 

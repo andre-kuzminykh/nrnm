@@ -250,10 +250,15 @@ def _make_step_runner(
         ))
         logger.info(
             "runtime: [%s] critic(%s)=%s | reason=%r",
-            step.id, verdict.provider, verdict.verdict, verdict.reason[:80],
+            step.id, verdict.provider, verdict.verdict, verdict.reason[:200],
         )
         if verdict.verdict == "fail":
-            logger.warning("runtime: [%s] CRITIC VETO -> replan_signal=critic_failed", step.id)
+            # Full reason on veto so ops can tell whether the critic
+            # was right or too strict.
+            logger.warning(
+                "runtime: [%s] CRITIC VETO -> replan_signal=critic_failed | full_reason=%r",
+                step.id, verdict.reason,
+            )
             state.replan_signal = "critic_failed"
             return state
 
@@ -336,9 +341,90 @@ def _execute_step(step: PlanStep, state: GraphState) -> Any:
             return {"error": result.error or "tool failed", "tool": step.tool}
         return result.output
 
-    # Pure reasoning step — no tool. Use the description as a placeholder
-    # synthesis. A real LLM call would go here.
-    return {"synthesis": step.description, "based_on": list(state.results.keys())}
+    # Pure reasoning / synthesis step — call the LLM to combine prior
+    # step results into real text. When there's no LLM key, fall back
+    # to a deterministic stub so tests stay offline-clean (NFR-14).
+    return _synthesize_step(step, state)
+
+
+def _synthesize_step(step: PlanStep, state: GraphState) -> Any:
+    """LLM-backed synthesis for tool-less steps.
+
+    Takes the step description + every prior step's result + the
+    original goal, asks GPT-4o-mini to produce a concise answer, and
+    returns `{"text": <llm output>, "based_on": [step ids]}`.
+
+    When LLM_API_KEY is empty, returns a deterministic stub carrying
+    the same shape so the runtime contract stays stable for tests.
+    """
+    import config
+
+    prior_ids = list(state.results.keys())
+
+    if not config.LLM_API_KEY:
+        return {
+            "text": f"(stub synthesis) {step.description}",
+            "based_on": prior_ids,
+        }
+
+    # Pack prior step outputs into a compact JSON-ish string so the
+    # model sees everything that happened before without hitting token
+    # limits. Each entry is trimmed to ~1500 chars.
+    import json as _json
+
+    def _pack(value: Any) -> str:
+        try:
+            s = _json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:  # noqa: BLE001
+            s = str(value)
+        return s if len(s) <= 1500 else s[:1500] + "…"
+
+    prior_block = "\n\n".join(
+        f"[{sid}]\n{_pack(state.results.get(sid))}"
+        for sid in prior_ids
+    )
+
+    system_msg = (
+        "You are the final-step synthesiser in a multi-step agent. "
+        "Combine the prior step outputs into a clean, useful answer "
+        "for the user's goal. Write in the same language as the goal. "
+        "Use markdown headers/bullets if helpful. Keep it concrete: "
+        "cite filenames or source titles inline when they appear in "
+        "the prior outputs. Do NOT add [1], [2] citation numbers. "
+        "If prior outputs are thin, say so honestly and summarise "
+        "what you do have."
+    )
+    user_msg = (
+        f"Goal: {state.goal}\n\n"
+        f"Step description: {step.description}\n"
+        f"Expected result: {step.expected_result}\n\n"
+        f"Prior step outputs:\n{prior_block if prior_block else '(none)'}"
+    )
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip() or "(пусто)"
+        logger.info(
+            "runtime: [%s] synthesised %d chars from %d prior steps",
+            step.id, len(text), len(prior_ids),
+        )
+        return {"text": text, "based_on": prior_ids}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("synthesis LLM failed for %s: %s", step.id, exc)
+        return {
+            "text": f"(synthesis failed: {exc})\n\nfallback: {step.description}",
+            "based_on": prior_ids,
+        }
 
 
 def _dispatch_tool(tool_name: str, args: dict, state: GraphState):

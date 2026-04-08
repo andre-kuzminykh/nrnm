@@ -167,6 +167,12 @@ Rules:
 - A step in a parallel_groups list must NOT depend on its siblings.
 - conditional_edges is optional — only when there's a real branching point.
 - tool=null means a reasoning / synthesis step done by the LLM itself.
+- The LAST step MUST be a tool=null synthesis step that depends on
+  every other step (or on the leaves of any parallel group). Its
+  job is to merge all prior results into a single final answer for
+  the user. Without it, the pipeline has no way to deliver a
+  consolidated response — runs without a final synthesis feel
+  broken to the user.
 """
 
 
