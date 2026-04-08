@@ -1,0 +1,390 @@
+# SPEC — Telegram AI Platform v1
+
+> Статус: зафиксировано (v1).
+> Источник: внутренняя продуктовая спека «Telegram AI Platform v1».
+> Идентификаторы требований (FR-*, NFR-*) — стабильные, на них завязаны тесты в `tests/`.
+
+---
+
+## 1. Feature Context
+
+**Feature**
+Telegram AI Platform v1: unified Memory + Chat/Task modes + supervised super-agent + basic tools.
+
+**Description (Goal / Scope)**
+Создать Telegram-бота как AI-платформу, где:
+
+* пользователь хранит все знания, файлы и результаты в едином разделе **Память**
+* пользователь работает в одном из двух режимов:
+  * **Чат**
+  * **Задачи**
+* в режиме **Чат** бот отвечает на вопросы с учётом Памяти
+* в режиме **Задачи** бот строит **полный план/граф действий**, показывает его пользователю, получает подтверждение и затем выполняет
+* инструменты v1 ограничены:
+  * **Web Search**
+  * **PDF Parser**
+  * **`[контекст]`** как явное подключение полного файла из Памяти
+
+**Client**
+Power users, founders, researchers, operators.
+
+**Problem**
+Обычные чат-боты:
+
+* не имеют единого пространства памяти
+* плохо работают с файлами как с управляемым контекстом
+* не разделяют режим «быстро поговорить» и режим «решить задачу»
+* не согласуют полный план действий перед выполнением
+* не сохраняют версионность контекста и файлов
+
+**Solution**
+Telegram-native AI workspace, где:
+
+* все документы, файлы, заметки и артефакты находятся в разделе **Память**
+* пользователь явно выбирает режим **Чат** или **Задачи**
+* в режиме **Чат** бот использует Память как источник контекста
+* в режиме **Задачи** бот:
+  * формирует полный граф действий
+  * показывает человеку понятный текстовый план
+  * получает подтверждение
+  * выполняет согласованный граф
+  * при отклонении пересобирает граф и повторно согласует изменения
+* пользователь может явно подключить файл через `[контекст]`
+
+**Metrics**
+
+* Time-to-first-response в режиме Чат < 10 sec
+* Time-to-plan-preview в режиме Задачи < 15 sec
+* ≥ 90% успешных retrieval-ответов из Памяти
+* ≥ 85% корректного разрешения ссылок `[контекст]`
+* 100% файлов в Памяти имеют version history
+* 100% runs в режиме Задачи имеют plan preview + execution trace + result summary
+
+---
+
+## 2. User Stories and Use Cases
+
+### User Story 1 — Unified Memory (US-1)
+
+**Role**: Пользователь платформы.
+
+**User Story**
+As a user, I want all my files, notes, and saved results to live in one unified Memory space, so that I can reuse them as persistent context.
+
+**UX / User Flow**
+Пользователь открывает раздел **Память**, загружает файлы, создаёт папки/секции внутри Памяти, сохраняет ответы и заметки, потом использует их в чате и задачах.
+
+#### Use Case UC-1.1 — сохранение объекта в Память
+
+* **Given**: пользователь открыл раздел Память.
+* **When**: загружает файл или сохраняет результат в Память.
+* **Then**: система сохраняет объект, создаёт метаданные и версию.
+* **Input**: файл / текст / ответ бота, optional имя, optional папка.
+* **Output**: memory object created, object ID, version = v1, confirmation.
+* **State**: объект сохранён, version history инициализирована, объект доступен для Чата и Задач.
+
+Functional Requirements
+
+| ID   | Requirement                                                                                                   |
+| ---- | ------------------------------------------------------------------------------------------------------------- |
+| FR-1 | Система должна поддерживать единый раздел Память как контейнер всех файлов, заметок и сохранённых результатов |
+| FR-2 | Система должна позволять загружать файлы и сохранять текстовые объекты в Память                               |
+| FR-3 | Система должна автоматически создавать первую версию объекта при сохранении                                   |
+
+Non-Functional Requirements
+
+| ID    | Requirement                                                                      |
+| ----- | -------------------------------------------------------------------------------- |
+| NFR-1 | Сохранение объекта в Память должно быть идемпотентным при повторном подтверждении |
+| NFR-2 | Каждый объект Памяти должен иметь уникальный ID, timestamps и metadata            |
+| NFR-3 | Все объекты Памяти должны быть доступны для последующего retrieval                |
+
+#### Use Case UC-1.2 — `[контекст]` / явное подключение файла
+
+* **Given**: в Памяти уже есть сохранённые файлы.
+* **When**: пользователь указывает `[контекст]` или `[имя_файла]` в сообщении.
+* **Then**: система подключает выбранный объект Памяти как полный контекст текущего запроса.
+* **Input**: сообщение + `[контекст]` / `[file_name]` / `[file_name@v2]`.
+* **Output**: answer with attached memory context, resolved list, optional disambiguation.
+* **State**: context resolution залогирован, объект прикреплён к сессии/run.
+
+Functional Requirements
+
+| ID   | Requirement                                                                                                                                |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| FR-4 | Система должна поддерживать явное подключение объектов Памяти через ссылочный синтаксис                                                    |
+| FR-5 | Система должна использовать выбранный файл как полный контекст, даже если под капотом он обрабатывается через parse/chunk/summary pipeline |
+
+Non-Functional Requirements
+
+| ID    | Requirement                                                                                 |
+| ----- | ------------------------------------------------------------------------------------------- |
+| NFR-4 | Resolver должен использовать порядок exact match → alias match → fuzzy match                |
+| NFR-5 | При указании версии система должна использовать ровно указанную версию; без версии — latest |
+
+---
+
+### User Story 2 — Chat / Task modes (US-2)
+
+**Role**: пользователь, который хочет либо общаться, либо запускать задачу.
+
+**User Story**
+As a user, I want the bot to work in either Chat mode or Task mode, so that I can either ask quick questions or launch controlled task execution.
+
+**UX / User Flow**
+Пользователь выбирает режим:
+
+* **Чат** — для быстрых ответов
+* **Задачи** — для постановки целей и выполнения по плану
+
+#### Use Case UC-2.1 — режим Чат
+
+* **Given**: пользователь включил режим Чат.
+* **When**: задаёт вопрос.
+* **Then**: система отвечает как чат-бот, используя Память и явный `[контекст]`, если указан.
+* **Input**: user message, optional memory refs, optional uploaded file.
+* **Output**: answer, optional suggestion to save result to Memory.
+* **State**: chat session active, task graph НЕ создаётся, retrieval trace залогирован если использована Память.
+
+Functional Requirements
+
+| ID   | Requirement                                                                 |
+| ---- | --------------------------------------------------------------------------- |
+| FR-6 | Система должна поддерживать режим Чат как быстрый conversational mode        |
+| FR-7 | В режиме Чат система должна использовать Память как источник контекста       |
+| FR-8 | В режиме Чат система не должна строить execution graph для простых запросов  |
+
+Non-Functional Requirements
+
+| ID    | Requirement                                                                                    |
+| ----- | ---------------------------------------------------------------------------------------------- |
+| NFR-6 | Ответы в режиме Чат должны приходить быстрее, чем в режиме Задачи, при сопоставимой сложности  |
+| NFR-7 | Режим Чат должен работать без обязательного предварительного планирования                      |
+
+#### Use Case UC-2.2 — режим Задачи
+
+* **Given**: пользователь включил режим Задачи.
+* **When**: формулирует цель естественным языком.
+* **Then**: система строит полный граф действий, показывает текстовый план, ждёт согласования и только потом стартует.
+* **Input**: goal, optional memory refs, optional constraints.
+* **Output**: plan preview, planned steps, expected outputs, approval request.
+* **State**: task run created, draft graph готов, execution не стартовал до approval.
+
+Functional Requirements
+
+| ID    | Requirement                                                                                               |
+| ----- | --------------------------------------------------------------------------------------------------------- |
+| FR-9  | Система должна поддерживать режим Задачи как supervised execution mode                                    |
+| FR-10 | В режиме Задачи система должна строить полный граф выполнения до старта execution                         |
+| FR-11 | Система должна показывать пользователю текстовое представление полного плана и ждать явного подтверждения |
+
+Non-Functional Requirements
+
+| ID    | Requirement                                                                    |
+| ----- | ------------------------------------------------------------------------------ |
+| NFR-8 | План должен быть понятен пользователю и не показывать внутренний граф напрямую |
+| NFR-9 | Execution в режиме Задачи не должен стартовать без explicit approval           |
+
+---
+
+### User Story 3 — Supervised execution with basic tools (US-3)
+
+**Role**: пользователь, который хочет решать задачи с инструментами.
+
+**User Story**
+As a user, I want the Task mode to use only the approved basic tools and follow the agreed graph, so that execution is predictable and controllable.
+
+**UX / User Flow**
+Пользователь ставит цель в режиме Задачи. Бот строит план, где может использовать:
+
+* Web Search
+* PDF Parser
+* `[контекст]`
+
+После подтверждения бот выполняет задачу по плану и пересобирает граф только если застрял или не получил ожидаемый результат.
+
+#### Use Case UC-3.1 — выполнение approved graph
+
+* **Given**: пользователь подтвердил план.
+* **When**: система выполняет согласованный граф.
+* **Then**: последовательно/параллельно проходит этапы, вызывает только доступные инструменты, сверяет результат с expected outputs, при необходимости инициирует replanning.
+* **Input**: approved plan, memory context, optional explicit `[контекст]`, allowed tools = `web_search` + `pdf_parser`.
+* **Output**: final result, execution summary, созданные memory objects, revised plan request если граф существенно изменился.
+* **State**: approved graph executing, node/stage results logged, replan только после deviation detection.
+
+Functional Requirements
+
+| ID    | Requirement                                                                                                                                          |
+| ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| FR-12 | Система должна выполнять задачу строго по согласованному графу                                                                                       |
+| FR-13 | Система должна использовать в v1 только инструменты Web Search и PDF Parser                                                                          |
+| FR-14 | Система должна поддерживать `[контекст]` как встроенный механизм полного подключения файла из Памяти                                                 |
+| FR-15 | Для каждого этапа система должна иметь expected result и acceptance criteria                                                                         |
+| FR-16 | Если фактический результат не соответствует expected result, система должна пересобрать граф выполнения                                              |
+| FR-17 | Если пересобранный граф materially меняет будущие действия, система должна повторно показать обновлённый план пользователю и получить подтверждение  |
+
+Non-Functional Requirements
+
+| ID     | Requirement                                                                                |
+| ------ | ------------------------------------------------------------------------------------------ |
+| NFR-10 | Все tool calls и node results должны быть traceable                                        |
+| NFR-11 | Replanning должен сохранять уже валидные завершённые этапы, если они остаются релевантными |
+
+---
+
+## 3. Architecture / Solution
+
+### 3.1 Client Side
+
+| Area                    | Value                                                                                               |
+| ----------------------- | --------------------------------------------------------------------------------------------------- |
+| Client Type             | Telegram bot                                                                                        |
+| User Entry Points       | Текстовые сообщения, загрузка файлов, inline buttons, переключатель режима                          |
+| Main Screens / Commands | `/start`, `/memory`, `/mode`, `/chat`, `/task`, `/save`, `/versions`                                |
+| Input / Output Format   | NL input, file upload, `[контекст]`, plan preview, confirmation buttons, task summary               |
+
+### 3.2 Backend Services
+
+| Service            | Responsibility                                                        | API                                                                           |
+| ------------------ | --------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Telegram Gateway   | Приём сообщений, файлов, callback actions, mode switching             | `Update → internal request`                                                   |
+| Memory Service     | Хранение всех файлов, заметок, результатов; версии; retrieval         | `CreateMemoryObject`, `ReadMemoryObject`, `ResolveContextRef`, `ListVersions` |
+| Chat Runtime       | Обработка запросов в режиме Чат                                        | `ChatRequest → ChatResponse`                                                  |
+| Planner / Graph    | Полный граф в режиме Задачи                                            | `TaskRequest → PlanDraft`                                                     |
+| Approval Controller| Согласование исходного и пересобранного плана                          | `PlanDraft → ApprovalDecision`                                                |
+| Task Executor      | Исполнение approved graph                                              | `ApprovedPlan → TaskRun`                                                      |
+| Tool Layer         | Web Search, PDF Parser (v1)                                            | `ToolCallRequest → ToolCallResult`                                            |
+| Verification Layer | Проверка этапов against expected result                                | `StageOutput → VerificationVerdict`                                           |
+| Replanning Engine  | Пересборка графа при deviation                                         | `RunState + FailureContext → RevisedPlanDraft`                                |
+
+### 3.3 Data Architecture
+
+**Main entities**: `User`, `MemoryFolder`, `MemoryObject`, `MemoryObjectVersion`, `ChatSession`, `TaskSession`, `PlanDraft`, `ApprovedPlan`, `TaskRun`, `StageRun`, `ToolCall`, `TraceEvent`.
+
+**Relationships**
+
+```
+User 1:N MemoryFolder
+MemoryFolder 1:N MemoryObject
+MemoryObject 1:N MemoryObjectVersion
+User 1:N ChatSession
+User 1:N TaskSession
+TaskSession 1:1 ApprovedPlan
+TaskRun 1:N StageRun
+StageRun 1:N ToolCall
+```
+
+**Data flow**
+
+```
+Telegram input
+  → Mode Router
+  → Chat Runtime | Planner
+  → Approval
+  → Executor
+  → Verification
+  → Replanning (if needed)
+  → Result
+  → Save to Memory
+```
+
+### 3.4 Infrastructure
+
+* Telegram Bot API
+* Python backend
+* PostgreSQL (metadata)
+* Object storage (Memory objects)
+* Vector index (Memory retrieval)
+* Redis (session state, queues)
+* LLM provider
+* Web Search integration
+* PDF Parser service
+* Logging / tracing stack
+
+---
+
+## 4. Work Plan — Mapping Use Case → Tasks
+
+| Use Case | Task ID | Task                                                           | Dependencies | DoD                                                                                             |
+| -------- | ------- | -------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------- |
+| UC-1.1   | T-1     | Unified Memory + versioned objects                             | Storage      | Файлы и тексты сохраняются в Память с версиями                                                  |
+| UC-1.2   | T-2     | `[контекст]` и context resolver                                | T-1          | Ссылки на файлы из Памяти корректно подключаются как полный контекст                            |
+| UC-2.1   | T-3     | Режим Чат                                                      | T-1, T-2     | Чат-режим отвечает с учётом Памяти                                                              |
+| UC-2.2   | T-4     | Режим Задачи с полным планом и approval flow                   | T-1, T-2     | Полный граф строится до старта и согласуется с пользователем                                    |
+| UC-3.1   | T-5     | Task execution + tools + verification + replanning             | T-4          | Approved graph исполняется, использует web search/pdf parser, при сбое пересобирается           |
+
+---
+
+## 5. Product Rules
+
+### Rule 1 — Unified Memory
+«Память» — это один раздел, где лежит всё: файлы, PDF, заметки, сохранённые ответы, результаты задач. Отдельных пользовательских сущностей «домены» и «файлы» как разных модулей нет — они входят в Память как структура хранения.
+
+### Rule 2 — Only Two Modes
+В продукте есть только два режима: **Чат** и **Задачи**.
+
+### Rule 3 — Limited Tools in v1
+В v1 доступны только:
+
+* **Web Search**
+* **PDF Parser**
+* **`[контекст]`** — встроенный механизм явного подключения файла из Памяти
+
+### Rule 4 — Full Planning Before Execution
+В режиме Задачи: сначала строится **весь граф**, потом показывается **весь план**, потом пользователь его **подтверждает**, только после этого начинается выполнение.
+
+### Rule 5 — Replanning Only on Deviation
+Graph re-evaluation запускается только если:
+
+* не получен expected result
+* этап не прошёл acceptance criteria
+* tool failure blocks progress
+* отсутствует нужный input
+* пользователь изменил constraints
+
+### Rule 6 — Versioning
+Каждый объект Памяти versioned:
+
+* обновление создаёт новую версию
+* старая версия сохраняется
+* `[file@v2]` закрепляет конкретную версию
+* без версии используется latest
+
+---
+
+## 6. Requirement → Test Mapping
+
+Тесты лежат в `tests/` и названы так, что каждый ID требования попадает в имя теста (`test_fr_1_*`, `test_nfr_4_*`, и т.д.).
+
+| ID     | Test file                        |
+| ------ | -------------------------------- |
+| FR-1   | `tests/test_us1_memory.py`       |
+| FR-2   | `tests/test_us1_memory.py`       |
+| FR-3   | `tests/test_us1_memory.py`       |
+| FR-4   | `tests/test_us1_memory.py`       |
+| FR-5   | `tests/test_us1_memory.py`       |
+| NFR-1  | `tests/test_us1_memory.py`       |
+| NFR-2  | `tests/test_us1_memory.py`       |
+| NFR-3  | `tests/test_us1_memory.py`       |
+| NFR-4  | `tests/test_us1_memory.py`       |
+| NFR-5  | `tests/test_us1_memory.py`       |
+| FR-6   | `tests/test_us2_modes.py`        |
+| FR-7   | `tests/test_us2_modes.py`        |
+| FR-8   | `tests/test_us2_modes.py`        |
+| FR-9   | `tests/test_us2_modes.py`        |
+| FR-10  | `tests/test_us2_modes.py`        |
+| FR-11  | `tests/test_us2_modes.py`        |
+| NFR-6  | `tests/test_us2_modes.py`        |
+| NFR-7  | `tests/test_us2_modes.py`        |
+| NFR-8  | `tests/test_us2_modes.py`        |
+| NFR-9  | `tests/test_us2_modes.py`        |
+| FR-12  | `tests/test_us3_execution.py`    |
+| FR-13  | `tests/test_us3_execution.py`    |
+| FR-14  | `tests/test_us3_execution.py`    |
+| FR-15  | `tests/test_us3_execution.py`    |
+| FR-16  | `tests/test_us3_execution.py`    |
+| FR-17  | `tests/test_us3_execution.py`    |
+| NFR-10 | `tests/test_us3_execution.py`    |
+| NFR-11 | `tests/test_us3_execution.py`    |
+
+> На момент фиксации v1-спеки многие поведения ещё не реализованы в коде (`services/platform.py` описывает legacy domain-based API из FR-P1..P19). Тесты под ещё не реализованные требования помечены `pytest.skip(...)` с явным `TODO` — они образуют spec-driven roadmap и активируются по мере реализации соответствующих модулей.
