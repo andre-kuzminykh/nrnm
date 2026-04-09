@@ -1330,23 +1330,16 @@ async def _handle_web_search(message: Message) -> None:
 
     platform_svc.add_chat_message(tg_id, "assistant", answer or hits_text)
 
-    # Render: LLM answer + source links below
+    # Render: just the LLM answer with hyperlinks already inline.
+    # No separate sources block — the LLM is prompted to embed URLs
+    # directly in the text via the web_search.md system prompt.
     answer_html = _render_answer_with_hyperlinks(answer) if answer else ""
-    source_lines = []
-    for hit in hits[:6]:
-        title = _html.escape(hit.get("title") or "")
-        url = hit.get("url") or ""
-        if url:
-            source_lines.append(f'• <a href="{_html.escape(url)}">{title}</a>')
-    sources_block = "\n".join(source_lines)
 
     parts = [f"🌐 <b>{_html.escape(_model_label(user.model_id))}</b>"]
     if search_query != raw_query:
         parts.append(f"<i>Запрос: {_html.escape(search_query)}</i>")
     if answer_html:
         parts.append(answer_html)
-    if sources_block:
-        parts.append(f"\n{sources_block}")
     text = "\n\n".join(parts)
     if len(text) > 3800:
         text = text[:3800] + "\n<i>…(обрезано)</i>"

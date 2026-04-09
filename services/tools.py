@@ -83,21 +83,34 @@ def _web_search_serpapi(query: str, num: int = 5) -> ToolCallResult:
         "api_key": config.SERPAPI_API_KEY,
         "num": num,
     }
-    try:
-        with httpx.Client(timeout=config.SERPAPI_TIMEOUT) as client:
-            resp = client.get(config.SERPAPI_ENDPOINT, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
-        logger.warning("SerpAPI HTTP error: %s", exc)
+    import time as _time
+
+    last_err = ""
+    data = None
+    for attempt in range(1, 4):  # 3 attempts
+        try:
+            with httpx.Client(timeout=config.SERPAPI_TIMEOUT) as client:
+                resp = client.get(config.SERPAPI_ENDPOINT, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            last_err = f"serpapi timeout (attempt {attempt}/3): {exc}"
+            logger.warning("SerpAPI timeout attempt %d/3: %s", attempt, exc)
+            if attempt < 3:
+                _time.sleep(1.0 * attempt)
+        except httpx.HTTPError as exc:
+            last_err = f"serpapi http: {exc}"
+            logger.warning("SerpAPI HTTP error: %s", exc)
+            break  # non-timeout HTTP errors don't retry
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"serpapi: {exc}"
+            logger.warning("SerpAPI unexpected: %s", exc)
+            break
+
+    if data is None:
         return ToolCallResult(
-            status="error", error=f"serpapi http: {exc}",
-            metadata={"tool": "web_search", "provider": "serpapi", "query": query},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("SerpAPI unexpected: %s", exc)
-        return ToolCallResult(
-            status="error", error=f"serpapi: {exc}",
+            status="error", error=last_err,
             metadata={"tool": "web_search", "provider": "serpapi", "query": query},
         )
 
