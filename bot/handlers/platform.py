@@ -1782,22 +1782,26 @@ async def _run_with_live_progress(
             asyncio.to_thread(modes_svc.execute, session_id)
         )
 
-    # Progress state: only track current action + completion %
-    total_steps = 1  # updated when planner_done fires
+    # Progress state: bar + current action + detail line
+    total_steps = 1
     completed_steps = 0
     current_action = "запускаю…"
+    detail = ""
     last_edit = 0.0
-    min_edit_interval = 1.2
+    min_edit_interval = 1.0
 
-    def _progress_bar(pct: int) -> str:
-        """Visual progress bar: ████░░░░░░ 40%"""
-        filled = pct // 10
-        empty = 10 - filled
-        return "█" * filled + "░" * empty + f" {pct}%"
+    def _bar(pct: int) -> str:
+        filled = pct // 5
+        empty = 20 - filled
+        return "▓" * filled + "░" * empty + f" {pct}%"
 
     async def _render() -> None:
         pct = min(99, int(completed_steps / max(total_steps, 1) * 100))
-        text = f"🧠 {_progress_bar(pct)}\n\n{_html.escape(current_action)}"
+        parts = [f"🧠 <code>{_bar(pct)}</code>"]
+        parts.append(f"\n{_html.escape(current_action)}")
+        if detail:
+            parts.append(f"<i>{_html.escape(detail)}</i>")
+        text = "\n".join(parts)
         try:
             await status_message.edit_text(text, parse_mode=ParseMode.HTML)
         except TelegramBadRequest as e:
@@ -1805,6 +1809,53 @@ async def _run_with_live_progress(
                 logger.debug("status edit: %s", e)
         except Exception:  # noqa: BLE001
             pass
+
+    def _handle_event(kind, node_id, payload):
+        nonlocal total_steps, completed_steps, current_action, detail
+        if kind == "planner_done":
+            total_steps = payload.get("steps", 1) or 1
+            current_action = f"📋 План построен: {total_steps} шагов"
+            detail = ""
+        elif kind == "step_start":
+            desc = (payload.get("description") or "")[:80]
+            tool = payload.get("tool")
+            tag = f" 🔧 {tool}" if tool else " 💡"
+            current_action = f"▸ {desc}{tag}"
+            detail = ""
+        elif kind == "tool_call_done":
+            status = payload.get("status")
+            if status == "ok":
+                hits = payload.get("hits")
+                h = f" ({hits} hits)" if hits is not None else ""
+                detail = f"✅ Результат получен{h}"
+            else:
+                detail = f"⚠️ Ошибка: {(payload.get('error') or '')[:60]}"
+        elif kind == "tool_retry":
+            attempt = payload.get("attempt", "?")
+            detail = f"🔄 Повтор {attempt}/3…"
+        elif kind == "critic":
+            verdict = payload.get("verdict", "?")
+            icon = "✅" if verdict == "pass" else "❌"
+            reason = (payload.get("reason") or "")[:60]
+            detail = f"🧐 Критик: {icon} {reason}"
+        elif kind == "process_critic":
+            action = payload.get("action", "?")
+            icon = "▶️" if action == "continue" else "🛑"
+            detail = f"🧠 Процесс: {icon} {(payload.get('reason') or '')[:60]}"
+        elif kind == "alignment":
+            drift = float(payload.get("drift", 0))
+            detail = f"🎯 Alignment: drift={drift:.2f}"
+        elif kind == "step_done" or kind == "step_soft_pass":
+            completed_steps += 1
+            detail = "✅ Шаг завершён"
+        elif kind == "synthesising":
+            current_action = "💡 Формирую финальный ответ…"
+            detail = ""
+        elif kind == "synthesis_done":
+            completed_steps += 1
+            detail = f"✅ Ответ готов ({payload.get('chars', 0)} симв.)"
+        elif kind == "step_abort":
+            detail = f"🛑 {(payload.get('reason') or '')[:60]}"
 
     # Main drain loop
     while not task.done():
@@ -1815,24 +1866,7 @@ async def _run_with_live_progress(
             except _queue.Empty:
                 break
             changed = True
-            if kind == "planner_done":
-                total_steps = payload.get("steps", 1) or 1
-                current_action = f"📋 План: {total_steps} шагов"
-            elif kind == "step_start":
-                desc = (payload.get("description") or "")[:80]
-                tool = payload.get("tool")
-                tag = f" 🔧 {tool}" if tool else ""
-                current_action = f"▸ {desc}{tag}"
-            elif kind == "tool_retry":
-                attempt = payload.get("attempt", "?")
-                current_action = f"🔄 Повтор {attempt}/3…"
-            elif kind == "step_done" or kind == "step_soft_pass":
-                completed_steps += 1
-            elif kind == "synthesising":
-                current_action = "💡 Формирую ответ…"
-            elif kind == "synthesis_done":
-                completed_steps += 1
-                current_action = "✅ Готово"
+            _handle_event(kind, node_id, payload)
 
         now = _time.monotonic()
         if changed and (now - last_edit) >= min_edit_interval:
@@ -1847,8 +1881,7 @@ async def _run_with_live_progress(
             kind, node_id, payload = progress_q.get_nowait()
         except _queue.Empty:
             break
-        if kind in ("step_done", "step_soft_pass", "synthesis_done"):
-            completed_steps += 1
+        _handle_event(kind, node_id, payload)
 
     # Await the task — re-raises any exception from the worker
     try:
@@ -1907,9 +1940,15 @@ def _md_to_html(text: str) -> str:
     """Convert basic markdown to Telegram HTML.
 
     Handles: # headings → <b>, **bold** → <b>, URLs → <a href>,
-    strips [N] markers, preserves line breaks.
+    strips [N] markers, unwraps (https://...) parentheses,
+    preserves line breaks.
     """
     import re
+
+    # Pre-process: unwrap markdown links [text](url) → text url
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+?)\)", r"\1 \2 ", text)
+    # Pre-process: unwrap bare parenthesized URLs (https://...) → https://...
+    text = re.sub(r"\((https?://[^)]+?)\)", r" \1 ", text)
 
     lines = text.split("\n")
     out: list[str] = []
@@ -1919,15 +1958,14 @@ def _md_to_html(text: str) -> str:
         if m:
             out.append(f"<b>{_html.escape(m.group(1))}</b>")
             continue
-        # Escape HTML first, then apply formatting
         esc = _html.escape(line)
         # **bold** → <b>bold</b>
         esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
         # Strip [N] markers
         esc = re.sub(r"\s*\[\d+\]", "", esc)
-        # URLs → <a href>
+        # URLs → <a href> (after escaping, & becomes &amp; — need to handle)
         esc = re.sub(
-            r"(https?://[^\s<\"]+)",
+            r"(https?://[^\s<&]+(?:&amp;[^\s<&]+)*)",
             r'<a href="\1">\1</a>',
             esc,
         )
@@ -1984,17 +2022,20 @@ async def on_task_approve(callback: CallbackQuery):
         )
         return
 
-    # Kill the approval keyboard so a second tap doesn't kick off a
-    # duplicate run.
+    # Reuse the PLAN message as the progress message — edit it in place.
+    # This replaces the plan with the progress bar (no new message).
+    status = callback.message
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
+        await status.edit_text(
+            "🧠 <code>░░░░░░░░░░░░░░░░░░░░ 0%</code>\n\nзапускаю…",
+            parse_mode=ParseMode.HTML,
+        )
     except TelegramBadRequest:
-        pass
-
-    status = await callback.message.answer(
-        "🎯 <b>Выполнение плана</b>\n\n<i>запускаю…</i>",
-        parse_mode=ParseMode.HTML,
-    )
+        # If edit fails, send a new message as fallback
+        status = await callback.message.answer(
+            "🧠 <code>░░░░░░░░░░░░░░░░░░░░ 0%</code>\n\nзапускаю…",
+            parse_mode=ParseMode.HTML,
+        )
 
     # Clear refinement state — plan is locked, starting execution
     tg_id = callback.from_user.id

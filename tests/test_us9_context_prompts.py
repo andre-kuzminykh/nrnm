@@ -88,6 +88,35 @@ def test_fr_44_superagent_refinement_includes_original_goal():
     _PLAN_HISTORY.pop(tg_id, None)
 
 
+def test_fr_44_md_to_html_converts_urls_and_strips_parens():
+    """URLs in synthesis should become <a href> hyperlinks.
+    Parenthesized URLs (https://...) and [text](url) should be unwrapped."""
+    try:
+        from bot.handlers.platform import _md_to_html
+    except ImportError:
+        pytest.skip("handler not importable")
+
+    result = _md_to_html(
+        "# Отчёт\n\n"
+        "Рынок растёт по данным https://ifr.org/report на 15%.\n"
+        "Подробнее (https://example.com/details) здесь.\n"
+        "Также [см. отчёт](https://report.eu/2024).\n"
+        "Источник [1] не нужен."
+    )
+    # Headings
+    assert "<b>Отчёт</b>" in result
+    # Inline URL as <a href>
+    assert '<a href="https://ifr.org/report">' in result
+    # Parenthesized URL unwrapped
+    assert "(https://example.com/details)" not in result
+    assert '<a href="https://example.com/details">' in result
+    # Markdown link [text](url) unwrapped
+    assert "](https://" not in result
+    assert '<a href="https://report.eu/2024">' in result
+    # [1] stripped
+    assert "[1]" not in result
+
+
 def test_fr_44_web_search_query_uses_history(monkeypatch):
     """When user says "а в сша?" after asking about robots in Europe,
     the search query builder should produce something like
