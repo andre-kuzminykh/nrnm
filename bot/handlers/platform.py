@@ -65,6 +65,29 @@ router = Router()
 #   "new_domain"  — waiting for new-domain name
 _PLATFORM_WAIT: dict[int, str] = {}
 
+# Per-user list of bot message IDs that should be deleted on "🔄 reset".
+# Messages the user explicitly saved (💾 → ✅) are removed from this list
+# so they survive the wipe. Everything else = disposable dialog.
+_DISPOSABLE_MSGS: dict[int, list[int]] = {}
+
+
+def _track_msg(tg_id: int, message_id: int) -> None:
+    """Mark a bot message as disposable (will be deleted on reset)."""
+    _DISPOSABLE_MSGS.setdefault(tg_id, []).append(message_id)
+    # Cap at 200 to avoid unbounded growth in long sessions.
+    if len(_DISPOSABLE_MSGS[tg_id]) > 200:
+        _DISPOSABLE_MSGS[tg_id] = _DISPOSABLE_MSGS[tg_id][-200:]
+
+
+def _untrack_msg(tg_id: int, message_id: int) -> None:
+    """Remove a message from the disposable list (it was saved)."""
+    msgs = _DISPOSABLE_MSGS.get(tg_id)
+    if msgs:
+        try:
+            msgs.remove(message_id)
+        except ValueError:
+            pass
+
 
 def _set_wait(tg_id: int, state: str | None) -> None:
     if state is None:
@@ -93,9 +116,13 @@ async def _replace_widget(message, text, **kwargs):
         pass
     except Exception:  # noqa: BLE001
         logger.debug("widget delete failed", exc_info=True)
-    return await message.bot.send_message(
+    sent = await message.bot.send_message(
         chat_id=message.chat.id, text=text, **kwargs,
     )
+    # Track for the 🔄 reset wipe. We use chat_id as a proxy for
+    # tg_id when the real user id isn't available in this helper.
+    _track_msg(message.chat.id, sent.message_id)
+    return sent
 
 
 def _model_label(model_id: str) -> str:
@@ -734,10 +761,49 @@ async def _handle_mcp_fsm(message: Message) -> bool:
 
 @router.callback_query(F.data == "platform_reset")
 async def on_platform_reset(callback: CallbackQuery):
+    """🔄 Обновить контекст — wipe the disposable dialog.
+
+    1. Delete every tracked bot message (answers, status msgs, widgets)
+       EXCEPT those the user saved via 💾 (removed from the list by
+       _untrack_msg in on_platform_save_answer).
+    2. Clear chat_history so LLM forgets prior turns.
+    3. Send a FRESH main menu as a new message — the old widget is
+       gone (deleted above), so this is the only live message left.
+    """
     tg_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    bot = callback.message.bot
+
+    # 1. Delete disposable messages
+    msg_ids = list(_DISPOSABLE_MSGS.pop(tg_id, []))
+    # Also delete the message that had the 🔄 button itself
+    msg_ids.append(callback.message.message_id)
+    for mid in msg_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:  # noqa: BLE001
+            pass  # already deleted or too old (>48h)
+
+    # 2. Clear history
     platform_svc.reset_chat(tg_id)
-    await callback.answer("Контекст очищен")
-    await on_platform_menu(callback)
+
+    # 3. Fresh menu in a new message
+    user = platform_svc.get_user(tg_id)
+    _set_wait(tg_id, "platform")
+    await bot.send_message(
+        chat_id=chat_id,
+        text=_menu_text(user, tg_id),
+        reply_markup=platform_menu_keyboard(
+            _model_label(user.model_id),
+            platform_svc.get_active_domains(tg_id),
+            active_instrument=instruments_svc.get_active(tg_id),
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await callback.answer("🔄 Контекст очищен")
+    except Exception:  # noqa: BLE001
+        pass  # callback may be stale if message was already deleted
 
 
 # ── FR-P12: save LLM answer to memory ────────────────────────────
@@ -767,8 +833,9 @@ async def on_platform_save_answer(callback: CallbackQuery):
         return
     platform_svc.register_document(tg_id, domain_name, f"saved-{doc_id}.txt", n)
     await callback.answer(f"Сохранено в «{domain_name}» ({n} фр.)", show_alert=True)
-    # FR-P19: swap the inline button to its «✅ Сохранено» state so the user
-    # gets a persistent visual confirmation under the answer message itself.
+    # FR-P19: swap the inline button to its «✅» state. Also untrack
+    # the message so it survives the 🔄 reset wipe — saved = permanent.
+    _untrack_msg(tg_id, callback.message.message_id)
     try:
         await callback.message.edit_reply_markup(
             reply_markup=platform_answer_keyboard(saved=True),
@@ -990,12 +1057,13 @@ async def _handle_pure_chat(message: Message) -> None:
 
     platform_svc.add_chat_message(tg_id, "assistant", answer)
     answer_html = _render_answer_with_hyperlinks(answer)
-    await message.answer(
+    sent = await message.answer(
         f"💬 <b>{_html.escape(_model_label(user.model_id))}</b>\n\n{answer_html}",
         reply_markup=platform_answer_keyboard(),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+    _track_msg(tg_id, sent.message_id)
 
 
 # ── FR-28: web_search instrument handler ─────────────────────────
@@ -1064,6 +1132,7 @@ async def _handle_web_search(message: Message) -> None:
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+    _track_msg(tg_id, status.message_id)
 
 
 # ── FR-9..11: Task mode — goal → plan preview → approval ─────────
@@ -1224,7 +1293,7 @@ async def _handle_rag_chat(message: Message) -> None:
     # No numbered citations, no footer — just the answer + reply anchor.
     reply_to = next((s["message_id"] for s in sources if s["message_id"]), None)
     try:
-        await message.bot.send_message(
+        sent = await message.bot.send_message(
             chat_id=message.chat.id,
             text=final_text,
             reply_markup=platform_answer_keyboard(),
@@ -1234,14 +1303,14 @@ async def _handle_rag_chat(message: Message) -> None:
             allow_sending_without_reply=True,
         )
     except TelegramBadRequest:
-        # Reply target is gone — send without reply.
-        await message.bot.send_message(
+        sent = await message.bot.send_message(
             chat_id=message.chat.id,
             text=final_text,
             reply_markup=platform_answer_keyboard(),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+    _track_msg(tg_id, sent.message_id)
     try:
         await status.delete()
     except Exception:  # noqa: BLE001
