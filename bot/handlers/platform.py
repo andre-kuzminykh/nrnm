@@ -1374,15 +1374,24 @@ _PLAN_HISTORY: dict[int, list] = {}  # refinement history
 async def _handle_task_goal(message: Message) -> None:
     """Task mode entry: build full plan, show preview.
 
-    Context-aware: if a plan already exists for this user, the new
-    message is treated as a REFINEMENT — the original goal + all
-    prior refinements + the new text are sent to the planner so it
-    builds a better plan that accounts for the full conversation.
+    Context-aware via chat_history: if the user had prior superagent
+    conversations (e.g. "рынок роботов на Кипре" → result → "А в Греции?"),
+    the planner sees the full dialog so it knows "А в Греции?" means
+    "рынок роботов в Греции", not just "Греция" out of context.
+
+    Also supports plan refinement: if a plan is already showing
+    (before approval), the new message is appended as a refinement
+    and the plan is regenerated.
     """
     tg_id = message.from_user.id
     new_text = (message.text or "").strip()
     if not new_text:
         return
+
+    user = platform_svc.get_user(tg_id)
+
+    # Save the user message to chat_history so context accumulates
+    platform_svc.add_chat_message(tg_id, "user", new_text)
 
     # Delete the previous plan message
     old_plan_mid = _PLAN_MSG.pop(tg_id, None)
@@ -1392,16 +1401,36 @@ async def _handle_task_goal(message: Message) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    # Build the full goal with context from prior refinements
-    if tg_id not in _PLAN_GOAL:
-        # First message — this IS the goal
-        _PLAN_GOAL[tg_id] = new_text
-        _PLAN_HISTORY[tg_id] = []
-        full_goal = new_text
-    else:
-        # Refinement — append to history, build combined goal
+    # Build the full goal with context from chat_history + refinements.
+    # If there's an active refinement session (_PLAN_GOAL set), use the
+    # refinement flow. Otherwise, build from chat history.
+    if tg_id in _PLAN_GOAL:
+        # Refinement of existing plan
         _PLAN_HISTORY.setdefault(tg_id, []).append(new_text)
         parts = [f"Основная цель: {_PLAN_GOAL[tg_id]}"]
+        for i, ref in enumerate(_PLAN_HISTORY[tg_id], 1):
+            parts.append(f"Уточнение {i}: {ref}")
+        full_goal = "\n".join(parts)
+    else:
+        # New goal — but include chat_history context so follow-ups work.
+        # "А в Греции?" after "рынок роботов на Кипре" → planner sees both.
+        _PLAN_GOAL[tg_id] = new_text
+        _PLAN_HISTORY[tg_id] = []
+
+        history = user.chat_history[:-1]  # exclude the message we just added
+        if history:
+            # Include last few exchanges as context
+            context_lines = []
+            for msg in history[-6:]:
+                role = "User" if msg["role"] == "user" else "Agent"
+                context_lines.append(f"{role}: {msg['content'][:300]}")
+            full_goal = (
+                f"Контекст предыдущего диалога:\n"
+                + "\n".join(context_lines)
+                + f"\n\nНовая задача: {new_text}"
+            )
+        else:
+            full_goal = new_text
         for i, ref in enumerate(_PLAN_HISTORY[tg_id], 1):
             parts.append(f"Уточнение {i}: {ref}")
         full_goal = "\n".join(parts)
@@ -1785,13 +1814,12 @@ async def _run_with_live_progress(
             asyncio.to_thread(modes_svc.execute, session_id)
         )
 
-    # Progress state: bar + current action + detail line
+    # Progress state: tracks ALL active steps (parallel visibility)
     total_steps = 1
     completed_steps = 0
-    current_action = "запускаю…"
-    detail = ""
-    last_edit = 0.0
-    min_edit_interval = 1.0
+    # {node_id: "status line"} — one entry per active/recent step
+    active_steps: dict[str, str] = {}
+    header_line = "запускаю…"
 
     def _bar(pct: int) -> str:
         filled = pct // 5
@@ -1800,11 +1828,15 @@ async def _run_with_live_progress(
 
     async def _render() -> None:
         pct = min(99, int(completed_steps / max(total_steps, 1) * 100))
-        parts = [f"🧠 <code>{_bar(pct)}</code>"]
-        parts.append(f"\n{_html.escape(current_action)}")
-        if detail:
-            parts.append(f"<i>{_html.escape(detail)}</i>")
-        text = "\n".join(parts)
+        lines = [f"🧠 <code>{_bar(pct)}</code>"]
+        if header_line:
+            lines.append(f"\n{_html.escape(header_line)}")
+        # Show ALL active steps (parallel steps are all visible)
+        for sid in list(active_steps.keys())[-6:]:
+            lines.append(active_steps[sid])
+        text = "\n".join(lines)
+        if len(text) > 3800:
+            text = text[:3800]
         try:
             await status_message.edit_text(text, parse_mode=ParseMode.HTML)
         except TelegramBadRequest as e:
@@ -1814,51 +1846,54 @@ async def _run_with_live_progress(
             pass
 
     def _handle_event(kind, node_id, payload):
-        nonlocal total_steps, completed_steps, current_action, detail
+        nonlocal total_steps, completed_steps, header_line
+        nid = node_id or "?"
         if kind == "planner_done":
             total_steps = payload.get("steps", 1) or 1
-            current_action = f"📋 План построен: {total_steps} шагов"
-            detail = ""
+            header_line = f"📋 План: {total_steps} шагов"
+            active_steps.clear()
         elif kind == "step_start":
-            desc = (payload.get("description") or "")[:80]
+            desc = (payload.get("description") or "")[:70]
             tool = payload.get("tool")
-            tag = f" 🔧 {tool}" if tool else " 💡"
-            current_action = f"▸ {desc}{tag}"
-            detail = ""
+            tag = f" 🔧 <code>{_html.escape(tool)}</code>" if tool else " 💡"
+            active_steps[nid] = f"▸ <b>{_html.escape(nid)}</b> {_html.escape(desc)}{tag}"
         elif kind == "tool_call_done":
-            status = payload.get("status")
-            if status == "ok":
+            st = payload.get("status")
+            if st == "ok":
                 hits = payload.get("hits")
                 h = f" ({hits} hits)" if hits is not None else ""
-                detail = f"✅ Результат получен{h}"
+                active_steps[nid] = f"  ✅ {_html.escape(nid)}: результат{h}"
+            elif st == "pending":
+                q = (payload.get("question") or "")[:50]
+                active_steps[nid] = f"  ⏸ {_html.escape(nid)}: ждёт ответа — <i>{_html.escape(q)}</i>"
             else:
-                detail = f"⚠️ Ошибка: {(payload.get('error') or '')[:60]}"
+                active_steps[nid] = f"  ⚠️ {_html.escape(nid)}: ошибка"
         elif kind == "tool_retry":
             attempt = payload.get("attempt", "?")
-            detail = f"🔄 Повтор {attempt}/3…"
+            active_steps[nid] = f"  🔄 {_html.escape(nid)}: повтор {attempt}/3"
         elif kind == "critic":
-            verdict = payload.get("verdict", "?")
-            icon = "✅" if verdict == "pass" else "❌"
-            reason = (payload.get("reason") or "")[:60]
-            detail = f"🧐 Критик: {icon} {reason}"
+            v = payload.get("verdict", "?")
+            icon = "✅" if v == "pass" else "❌"
+            r = (payload.get("reason") or "")[:50]
+            active_steps[nid] = f"  {icon} {_html.escape(nid)} критик: <i>{_html.escape(r)}</i>"
         elif kind == "process_critic":
-            action = payload.get("action", "?")
-            icon = "▶️" if action == "continue" else "🛑"
-            detail = f"🧠 Процесс: {icon} {(payload.get('reason') or '')[:60]}"
+            a = payload.get("action", "?")
+            icon = "▶️" if a == "continue" else "🛑"
+            active_steps[nid] = f"  {icon} {_html.escape(nid)} процесс: {_html.escape(a)}"
         elif kind == "alignment":
-            drift = float(payload.get("drift", 0))
-            detail = f"🎯 Alignment: drift={drift:.2f}"
+            d = float(payload.get("drift", 0))
+            active_steps[nid] = f"  🎯 {_html.escape(nid)} drift={d:.2f}"
         elif kind == "step_done" or kind == "step_soft_pass":
             completed_steps += 1
-            detail = "✅ Шаг завершён"
+            active_steps[nid] = f"  ✅ <b>{_html.escape(nid)}</b> готов"
         elif kind == "synthesising":
-            current_action = "💡 Формирую финальный ответ…"
-            detail = ""
+            header_line = "💡 Формирую ответ…"
+            active_steps[nid] = f"  💡 {_html.escape(nid)}: синтез из {payload.get('prior_count', '?')} шагов"
         elif kind == "synthesis_done":
             completed_steps += 1
-            detail = f"✅ Ответ готов ({payload.get('chars', 0)} симв.)"
+            active_steps[nid] = f"  ✅ {_html.escape(nid)}: готово ({payload.get('chars', 0)} симв.)"
         elif kind == "step_abort":
-            detail = f"🛑 {(payload.get('reason') or '')[:60]}"
+            active_steps[nid] = f"  🛑 {_html.escape(nid)}: {_html.escape((payload.get('reason') or '')[:50])}"
 
     # Main drain loop
     while not task.done():
@@ -2109,6 +2144,11 @@ async def on_task_approve(callback: CallbackQuery):
 
     # Final: just the result, nothing else
     final_text = _render_run_summary(run)
+    # Save the agent's answer to chat_history so next follow-up has context
+    synthesis = _extract_synthesis_text(run)
+    if synthesis:
+        tg_id = callback.from_user.id
+        platform_svc.add_chat_message(tg_id, "assistant", synthesis[:2000])
     if len(final_text) > 4000:
         final_text = final_text[:4000]
     try:

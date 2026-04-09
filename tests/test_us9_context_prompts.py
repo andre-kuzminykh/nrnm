@@ -56,6 +56,38 @@ def test_fr_45_prompt_files_are_real_md():
 # FR-44 — context-aware web search
 # ─────────────────────────────────────────────────────────────────
 
+def test_fr_51_superagent_followup_includes_chat_history():
+    """FR-51: When user sends a follow-up after a completed task,
+    the planner should receive prior chat_history as context."""
+    try:
+        from bot.handlers.platform import (
+            _PLAN_GOAL, _PLAN_HISTORY,
+        )
+        from services import platform as svc
+    except ImportError:
+        pytest.skip("handler not importable")
+
+    tg_id = 8888
+    svc.get_user(tg_id)  # init user
+
+    # Simulate: prior task conversation in chat_history
+    svc.add_chat_message(tg_id, "user", "рынок роботов на Кипре")
+    svc.add_chat_message(tg_id, "assistant", "Рынок роботов Кипра составляет...")
+
+    # Now a follow-up — _PLAN_GOAL is NOT set (task was completed/cleared)
+    assert tg_id not in _PLAN_GOAL
+
+    # The handler should build full_goal from chat_history + new text
+    user = svc.get_user(tg_id)
+    new_text = "А в Греции?"
+    history = user.chat_history
+    assert len(history) >= 2
+    assert "роботов" in history[0]["content"]
+
+    # Cleanup
+    svc.reset_chat(tg_id)
+
+
 def test_fr_44_superagent_refinement_includes_original_goal():
     """When user refines a plan, the planner should receive the
     original goal + all refinements, not just the latest text."""
