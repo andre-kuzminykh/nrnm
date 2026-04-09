@@ -1,52 +1,43 @@
-"""Minimal /start + main_menu handler for the standalone ИИ-платформа bot."""
+"""/start handler — opens the main menu directly, no intermediate screen."""
 
-from aiogram import Router, F
+from aiogram import Router
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import Message
 
-from bot.keyboards.inline import start_keyboard
+import config
+from services import platform as platform_svc
+from services import instruments as instruments_svc
+from bot.keyboards.inline import platform_menu_keyboard
 
 router = Router()
 
 
-WELCOME_TEXT = (
-    "👋 <b>Добро пожаловать в ИИ-платформу!</b>\n\n"
-    "Три инструмента:\n"
-    "• 💬 <b>Чат</b> — быстрые вопросы, файлы через "
-    "<code>[имя_файла]</code> / <code>[имя@v2]</code>\n"
-    "• 🔍 <b>Поиск по файлам</b> — RAG по выбранным доменам\n"
-    "• 🌐 <b>Веб-поиск</b> — актуальная информация из интернета\n\n"
-    "🤖 <b>СУПЕРАГЕНТ</b> — ставите цель, бот строит план "
-    "(LangGraph, параллелизм, условия), показывает его, ждёт "
-    "подтверждения и выполняет step-by-step с критикой.\n\n"
-    "Команды: /chat, /search, /web, /agent, /mode\n\n"
-    "Нажмите кнопку ниже, чтобы начать."
-)
+def _model_label(model_id: str) -> str:
+    return next(
+        (label for label, mid in config.PLATFORM_MODELS if mid == model_id),
+        model_id or "не выбрана",
+    )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    """Skip the old "🧠 ИИ-платформа" landing page — go straight to
+    the main menu with instruments, СУПЕРАГЕНТ, and model picker."""
+    tg_id = message.from_user.id
+    user = platform_svc.get_user(tg_id)
+
+    # Import here to set the wait state (lives in the platform handler)
+    from bot.handlers.platform import _set_wait
+    _set_wait(tg_id, "platform")
+
     await message.answer(
-        WELCOME_TEXT,
-        reply_markup=start_keyboard(),
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "Выберите инструмент или запустите 🧠 СУПЕРАГЕНТ.",
+        reply_markup=platform_menu_keyboard(
+            _model_label(user.model_id),
+            platform_svc.get_active_domains(tg_id),
+            active_instrument=instruments_svc.get_active(tg_id),
+        ),
         parse_mode=ParseMode.HTML,
     )
-
-
-@router.callback_query(F.data == "main_menu")
-async def on_main_menu(callback: CallbackQuery):
-    """Return to the main menu. Deletes the current widget and posts a
-    fresh welcome message — matches the replace-widget pattern used
-    throughout the platform handler (FR-P17)."""
-    try:
-        await callback.message.delete()
-    except Exception:  # noqa: BLE001
-        pass
-    await callback.message.bot.send_message(
-        chat_id=callback.message.chat.id,
-        text=WELCOME_TEXT,
-        reply_markup=start_keyboard(),
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
