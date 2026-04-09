@@ -55,8 +55,8 @@ _INSTRUMENTS: dict[str, Instrument] = {
     ),
     "file_search": Instrument(
         name="file_search",
-        icon="🔍",
-        label="Поиск по файлам",
+        icon="📁",
+        label="Память",
         description="RAG-поиск по выбранным доменам.",
         params={
             "domains": InstrumentParam(

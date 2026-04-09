@@ -110,22 +110,19 @@ def _mode_label(mode: str) -> str:
 
 
 def _instrument_hint(instrument: str) -> str:
-    """Short contextual hint shown in the main widget depending on
-    the active instrument."""
+    """Short contextual hint shown in the main widget."""
     hints = {
         "chat": (
-            "Просто пишите — отвечу с диалогом и историей.\n"
-            "Подключайте файл через <code>[имя_файла]</code> или "
-            "<code>[имя@v2]</code>.\n"
-            "<i>Память (RAG) не используется — только LLM + контекст.</i>"
+            "Просто пишите — чистый LLM с историей.\n"
+            "Файл целиком: <code>[имя]</code> / <code>[имя@v2]</code>."
         ),
         "file_search": (
-            "Введите запрос — поищу ответ по выбранным доменам (RAG).\n"
-            "Выберите домены в «💾 Память» ниже."
+            "Введите запрос — RAG по выбранным доменам.\n"
+            "Выберите домены в «📁 Домен(ы)» ниже."
         ),
         "web_search": (
-            "Введите запрос — поищу актуальную информацию "
-            "через SerpAPI. Ссылки будут кликабельные."
+            "Введите запрос — веб-поиск через SerpAPI.\n"
+            "Ссылки будут кликабельные."
         ),
     }
     return hints.get(instrument, hints["chat"])
@@ -215,20 +212,20 @@ async def on_platform_superagent(callback: CallbackQuery):
     await callback.message.bot.send_message(
         chat_id=callback.message.chat.id,
         text=(
-            "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
-            "Опишите задачу одним сообщением.\n\n"
-            "Я построю план (шаги, параллели, инструменты), "
-            "покажу его, и после подтверждения выполню step-by-step "
-            "с критикой каждого шага.\n\n"
-            "💡 Подключайте файлы из Памяти: <code>[имя]</code> или "
-            "<code>[имя@v2]</code>"
+            "🧠 <b>С У П Е Р А Г Е Н Т</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Опишите задачу <b>одним сообщением</b>.\n\n"
+            "Я разберу цель → построю полный план (параллели, условия, "
+            "инструменты) → покажу граф → после подтверждения выполню "
+            "step-by-step с критикой каждого шага и alignment-проверкой.\n\n"
+            "📎 Файлы из Памяти: <code>[имя]</code> / <code>[имя@v2]</code>"
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data="platform_menu")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="platform_menu")],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer("Введите задачу")
+    await callback.answer("🧠 Введите задачу")
 
 
 # ── Legacy command shortcuts (kept for keyboard convenience) ─────
@@ -1055,9 +1052,18 @@ async def _handle_web_search(message: Message) -> None:
         if snippet:
             lines.append(f"   <i>{snippet}</i>")
     text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n<i>…(обрезано)</i>"
-    await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    if len(text) > 3800:
+        text = text[:3800] + "\n<i>…(обрезано)</i>"
+    # Stash the answer so "💾 Сохранить в память" has something to save
+    user = platform_svc.get_user(tg_id)
+    user.last_answer = text
+    platform_svc._persist()
+    await status.edit_text(
+        text,
+        reply_markup=platform_answer_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 # ── FR-9..11: Task mode — goal → plan preview → approval ─────────
