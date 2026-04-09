@@ -75,11 +75,10 @@ _DISPOSABLE_MSGS: dict[int, list[int]] = {}
 
 
 def _track_msg(tg_id: int, message_id: int) -> None:
-    """Mark a bot message as disposable (will be deleted on reset)."""
+    """Mark a message (bot OR user) as disposable (deleted on 🔄 reset)."""
     _DISPOSABLE_MSGS.setdefault(tg_id, []).append(message_id)
-    # Cap at 200 to avoid unbounded growth in long sessions.
-    if len(_DISPOSABLE_MSGS[tg_id]) > 200:
-        _DISPOSABLE_MSGS[tg_id] = _DISPOSABLE_MSGS[tg_id][-200:]
+    if len(_DISPOSABLE_MSGS[tg_id]) > 400:
+        _DISPOSABLE_MSGS[tg_id] = _DISPOSABLE_MSGS[tg_id][-400:]
 
 
 def _untrack_msg(tg_id: int, message_id: int) -> None:
@@ -979,6 +978,7 @@ async def on_platform_document(message: Message):
     tg_id = message.from_user.id
     if _get_wait(tg_id) not in ("platform", "new_domain"):
         return  # not in platform mode — let other handlers take it
+    _track_msg(tg_id, message.message_id)
     await _ingest_file(message)
 
 
@@ -1061,6 +1061,9 @@ async def platform_handle_message(message: Message) -> bool:
     wait = _get_wait(tg_id)
     if wait is None:
         return False
+
+    # Track the user's message so it gets wiped on 🔄 reset too.
+    _track_msg(tg_id, message.message_id)
 
     # 0. MCP add/edit FSM — routes back to _handle_mcp_fsm which owns
     # its own in-progress draft dict.
