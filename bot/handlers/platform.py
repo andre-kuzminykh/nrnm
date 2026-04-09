@@ -1871,20 +1871,23 @@ async def _run_with_live_progress(
             changed = True
             _handle_event(kind, node_id, payload)
 
-        now = _time.monotonic()
-        if changed and (now - last_edit) >= min_edit_interval:
+        # Render on EVERY change — Telegram "not modified" errors
+        # are silently swallowed in _render(). No artificial rate
+        # limit — the real bottleneck is the LLM/tool calls which
+        # take seconds each, so we won't hit Telegram rate limits.
+        if changed:
             await _render()
-            last_edit = now
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
-    # Final drain
+    # Final drain + ALWAYS render the last state
     while True:
         try:
             kind, node_id, payload = progress_q.get_nowait()
         except _queue.Empty:
             break
         _handle_event(kind, node_id, payload)
+    await _render()
 
     # Await the task — re-raises any exception from the worker
     try:
