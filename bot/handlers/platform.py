@@ -1357,17 +1357,29 @@ async def _handle_web_search(message: Message) -> None:
 
 # ── FR-9..11: Task mode — goal → plan preview → approval ─────────
 
+# Per-user last plan message id — so we can delete it on refinement
+_PLAN_MSG: dict[int, int] = {}
+
+
 async def _handle_task_goal(message: Message) -> None:
     """Task mode entry: build full plan, show preview.
 
     User can either:
     - ✅ Подтвердить → plan erased, progress bar starts
-    - Send another message → plan regenerated with refinement
+    - Send another message → old plan DELETED, loading, new plan appears
     """
     tg_id = message.from_user.id
     goal = (message.text or "").strip()
     if not goal:
         return
+
+    # Delete the previous plan message if user is refining
+    old_plan_mid = _PLAN_MSG.pop(tg_id, None)
+    if old_plan_mid:
+        try:
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=old_plan_mid)
+        except Exception:  # noqa: BLE001
+            pass
 
     status = await message.answer("🧠 <i>Строю план…</i>", parse_mode=ParseMode.HTML)
     _track_msg(tg_id, status.message_id)
@@ -1386,7 +1398,8 @@ async def _handle_task_goal(message: Message) -> None:
         reply_markup=task_approval_keyboard(session.id),
         parse_mode=ParseMode.HTML,
     )
-    # Allow refinement: next text message regenerates the plan
+    # Remember this plan message so we can delete it on next refinement
+    _PLAN_MSG[tg_id] = status.message_id
     _set_wait(tg_id, "platform")
 
 
