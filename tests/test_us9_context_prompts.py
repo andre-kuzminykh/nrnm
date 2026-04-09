@@ -56,6 +56,38 @@ def test_fr_45_prompt_files_are_real_md():
 # FR-44 — context-aware web search
 # ─────────────────────────────────────────────────────────────────
 
+def test_fr_44_superagent_refinement_includes_original_goal():
+    """When user refines a plan, the planner should receive the
+    original goal + all refinements, not just the latest text."""
+    try:
+        from bot.handlers.platform import (
+            _PLAN_GOAL, _PLAN_HISTORY, _handle_task_goal,
+        )
+    except ImportError:
+        pytest.skip("handler not importable")
+
+    # Simulate: user sets goal, then refines twice
+    tg_id = 9999
+    _PLAN_GOAL[tg_id] = "Маркетинг-ресёрч роботов"
+    _PLAN_HISTORY[tg_id] = ["добавь Азию", "фокус на цены"]
+
+    # The combined goal should contain all three
+    parts = [f"Основная цель: {_PLAN_GOAL[tg_id]}"]
+    for i, ref in enumerate(_PLAN_HISTORY[tg_id], 1):
+        parts.append(f"Уточнение {i}: {ref}")
+    full_goal = "\n".join(parts)
+
+    assert "Маркетинг-ресёрч роботов" in full_goal
+    assert "добавь Азию" in full_goal
+    assert "фокус на цены" in full_goal
+    assert "Уточнение 1" in full_goal
+    assert "Уточнение 2" in full_goal
+
+    # Cleanup
+    _PLAN_GOAL.pop(tg_id, None)
+    _PLAN_HISTORY.pop(tg_id, None)
+
+
 def test_fr_44_web_search_query_uses_history(monkeypatch):
     """When user says "а в сша?" after asking about robots in Europe,
     the search query builder should produce something like

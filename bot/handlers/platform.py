@@ -214,12 +214,17 @@ async def on_platform_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("platform_instrument:"))
 async def on_platform_instrument_switch(callback: CallbackQuery):
+    tg_id = callback.from_user.id
     name = callback.data.split(":", 1)[1]
     try:
-        instruments_svc.set_active(callback.from_user.id, name)
+        instruments_svc.set_active(tg_id, name)
     except ValueError as e:
         await callback.answer(str(e), show_alert=True)
         return
+    # Clear superagent refinement state when switching away
+    _PLAN_GOAL.pop(tg_id, None)
+    _PLAN_HISTORY.pop(tg_id, None)
+    _PLAN_MSG.pop(tg_id, None)
     inst = instruments_svc.get_instrument(name)
     label = f"{inst.icon} {inst.label}" if inst else name
     await callback.answer(f"Инструмент: {label}")
@@ -1357,23 +1362,26 @@ async def _handle_web_search(message: Message) -> None:
 
 # ── FR-9..11: Task mode — goal → plan preview → approval ─────────
 
-# Per-user last plan message id — so we can delete it on refinement
-_PLAN_MSG: dict[int, int] = {}
+# Per-user plan refinement state
+_PLAN_MSG: dict[int, int] = {}       # last plan message id
+_PLAN_GOAL: dict[int, str] = {}      # original goal
+_PLAN_HISTORY: dict[int, list] = {}  # refinement history
 
 
 async def _handle_task_goal(message: Message) -> None:
     """Task mode entry: build full plan, show preview.
 
-    User can either:
-    - ✅ Подтвердить → plan erased, progress bar starts
-    - Send another message → old plan DELETED, loading, new plan appears
+    Context-aware: if a plan already exists for this user, the new
+    message is treated as a REFINEMENT — the original goal + all
+    prior refinements + the new text are sent to the planner so it
+    builds a better plan that accounts for the full conversation.
     """
     tg_id = message.from_user.id
-    goal = (message.text or "").strip()
-    if not goal:
+    new_text = (message.text or "").strip()
+    if not new_text:
         return
 
-    # Delete the previous plan message if user is refining
+    # Delete the previous plan message
     old_plan_mid = _PLAN_MSG.pop(tg_id, None)
     if old_plan_mid:
         try:
@@ -1381,15 +1389,41 @@ async def _handle_task_goal(message: Message) -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    # Build the full goal with context from prior refinements
+    if tg_id not in _PLAN_GOAL:
+        # First message — this IS the goal
+        _PLAN_GOAL[tg_id] = new_text
+        _PLAN_HISTORY[tg_id] = []
+        full_goal = new_text
+    else:
+        # Refinement — append to history, build combined goal
+        _PLAN_HISTORY.setdefault(tg_id, []).append(new_text)
+        parts = [f"Основная цель: {_PLAN_GOAL[tg_id]}"]
+        for i, ref in enumerate(_PLAN_HISTORY[tg_id], 1):
+            parts.append(f"Уточнение {i}: {ref}")
+        full_goal = "\n".join(parts)
+
     status = await message.answer("🧠 <i>Строю план…</i>", parse_mode=ParseMode.HTML)
     _track_msg(tg_id, status.message_id)
 
-    session = modes_svc.start_task(tg_id, goal)
+    session = modes_svc.start_task(tg_id, full_goal)
 
     preview_html = _html.escape(session.plan.human_readable)
+
+    # Show original goal + refinements so user sees full context
+    goal_display = _html.escape(_PLAN_GOAL.get(tg_id, new_text))
+    refinements = _PLAN_HISTORY.get(tg_id, [])
+    if refinements:
+        ref_lines = "\n".join(
+            f"  + {_html.escape(r)}" for r in refinements
+        )
+        goal_block = f"<b>Цель:</b> {goal_display}\n{ref_lines}"
+    else:
+        goal_block = f"<b>Цель:</b> {goal_display}"
+
     text = (
         f"🧠 <b>План</b>\n\n"
-        f"<b>Цель:</b> {_html.escape(goal)}\n\n"
+        f"{goal_block}\n\n"
         f"<pre>{preview_html}</pre>\n\n"
         "<i>✅ — запустить. Или напишите уточнение — перестрою план.</i>"
     )
@@ -1961,6 +1995,12 @@ async def on_task_approve(callback: CallbackQuery):
         "🎯 <b>Выполнение плана</b>\n\n<i>запускаю…</i>",
         parse_mode=ParseMode.HTML,
     )
+
+    # Clear refinement state — plan is locked, starting execution
+    tg_id = callback.from_user.id
+    _PLAN_GOAL.pop(tg_id, None)
+    _PLAN_HISTORY.pop(tg_id, None)
+    _PLAN_MSG.pop(tg_id, None)
 
     try:
         modes_svc.approve_plan(session_id)
