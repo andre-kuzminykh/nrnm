@@ -1748,42 +1748,57 @@ async def _run_with_live_progress(
             asyncio.to_thread(modes_svc.execute, session_id)
         )
 
-    header = "🎯 <b>Выполнение плана</b>\n"
-    lines: list[str] = []
+    # Progress state: only track current action + completion %
+    total_steps = 1  # updated when planner_done fires
+    completed_steps = 0
+    current_action = "запускаю…"
     last_edit = 0.0
-    min_edit_interval = 1.5  # seconds — Telegram rate limit protection
+    min_edit_interval = 1.2
+
+    def _progress_bar(pct: int) -> str:
+        """Visual progress bar: ████░░░░░░ 40%"""
+        filled = pct // 10
+        empty = 10 - filled
+        return "█" * filled + "░" * empty + f" {pct}%"
 
     async def _render() -> None:
-        """Build the current progress text and edit the status message."""
-        visible = lines[-_MAX_PROGRESS_LINES:]
-        body = "\n".join(visible) if visible else "<i>подожди, запускаю…</i>"
-        text = header + "\n" + body
-        # Telegram max ~4096 chars. Leave safety margin.
-        if len(text) > 3800:
-            text = text[:3800] + "\n<i>…(обрезано)</i>"
+        pct = min(99, int(completed_steps / max(total_steps, 1) * 100))
+        text = f"🧠 {_progress_bar(pct)}\n\n{_html.escape(current_action)}"
         try:
             await status_message.edit_text(text, parse_mode=ParseMode.HTML)
         except TelegramBadRequest as e:
-            # "message is not modified" fires when content hasn't
-            # changed — ignore. Any other bad request: log + swallow.
             if "not modified" not in str(e).lower():
                 logger.debug("status edit: %s", e)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("status edit unexpected: %s", exc)
+        except Exception:  # noqa: BLE001
+            pass
 
-    # Main drain loop — runs until the worker task finishes
+    # Main drain loop
     while not task.done():
-        # Drain any pending events
         changed = False
         while True:
             try:
                 kind, node_id, payload = progress_q.get_nowait()
             except _queue.Empty:
                 break
-            line = _format_progress_event(kind, node_id, payload)
-            if line:
-                lines.append(line)
-                changed = True
+            changed = True
+            if kind == "planner_done":
+                total_steps = payload.get("steps", 1) or 1
+                current_action = f"📋 План: {total_steps} шагов"
+            elif kind == "step_start":
+                desc = (payload.get("description") or "")[:80]
+                tool = payload.get("tool")
+                tag = f" 🔧 {tool}" if tool else ""
+                current_action = f"▸ {desc}{tag}"
+            elif kind == "tool_retry":
+                attempt = payload.get("attempt", "?")
+                current_action = f"🔄 Повтор {attempt}/3…"
+            elif kind == "step_done" or kind == "step_soft_pass":
+                completed_steps += 1
+            elif kind == "synthesising":
+                current_action = "💡 Формирую ответ…"
+            elif kind == "synthesis_done":
+                completed_steps += 1
+                current_action = "✅ Готово"
 
         now = _time.monotonic()
         if changed and (now - last_edit) >= min_edit_interval:
@@ -1792,19 +1807,14 @@ async def _run_with_live_progress(
 
         await asyncio.sleep(0.3)
 
-    # Final drain once the worker is done
+    # Final drain
     while True:
         try:
             kind, node_id, payload = progress_q.get_nowait()
         except _queue.Empty:
             break
-        line = _format_progress_event(kind, node_id, payload)
-        if line:
-            lines.append(line)
-
-    # Show the last progress snapshot once more so nothing is lost
-    if lines:
-        await _render()
+        if kind in ("step_done", "step_soft_pass", "synthesis_done"):
+            completed_steps += 1
 
     # Await the task — re-raises any exception from the worker
     try:
@@ -1859,75 +1869,52 @@ def _extract_synthesis_text(run) -> str | None:
     return None
 
 
-def _render_run_summary(run) -> str:
-    """Compact human-readable summary of a finished / partial task run.
+def _md_to_html(text: str) -> str:
+    """Convert basic markdown to Telegram HTML.
 
-    Two-section layout:
-    1. **The actual answer** — pulled from the last synthesis step
-       (the one _synthesize_step wrote). This is what the user asked
-       for; it goes first.
-    2. **Diagnostic block** — critic verdicts, goal alignment drifts,
-       trace count, backend, outcome. Collapsed after the answer so
-       the user can inspect or ignore it.
+    Handles: # headings → <b>, **bold** → <b>, URLs → <a href>,
+    strips [N] markers, preserves line breaks.
     """
-    summary = run.result_summary or {}
-    outcome = summary.get("outcome", "—")
-    reason = summary.get("reason", "")
-    backend = summary.get("backend", "")
+    import re
 
-    parts: list[str] = []
+    lines = text.split("\n")
+    out: list[str] = []
+    for line in lines:
+        # # Heading → <b>Heading</b>
+        m = re.match(r"^#{1,3}\s+(.*)", line)
+        if m:
+            out.append(f"<b>{_html.escape(m.group(1))}</b>")
+            continue
+        # Escape HTML first, then apply formatting
+        esc = _html.escape(line)
+        # **bold** → <b>bold</b>
+        esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
+        # Strip [N] markers
+        esc = re.sub(r"\s*\[\d+\]", "", esc)
+        # URLs → <a href>
+        esc = re.sub(
+            r"(https?://[^\s<\"]+)",
+            r'<a href="\1">\1</a>',
+            esc,
+        )
+        out.append(esc)
+    return "\n".join(out)
 
-    # 1. Actual synthesised answer — THIS is what the user wanted.
+
+def _render_run_summary(run) -> str:
+    """Final result of a task run — ONLY the answer, nothing else.
+
+    No diagnostics, no critic verdicts, no trace counts.
+    Just the synthesised answer converted from markdown to HTML.
+    """
     synthesis = _extract_synthesis_text(run)
     if synthesis:
-        # Telegram HTML max message length is 4096 chars; leave room
-        # for the diagnostic footer.
-        if len(synthesis) > 3500:
-            synthesis = synthesis[:3500] + "\n\n<i>…(обрезано, полный ответ в логах)</i>"
-        parts.append(f"📝 <b>Ответ:</b>\n\n{_html.escape(synthesis)}")
-
-    # 2. Diagnostic footer
-    stage_lines = [
-        f"  • {s.node_id}: {'✅' if s.status == 'pass' else '❌'}"
-        for s in run.stages
-    ]
-
-    critic_lines: list[str] = []
-    drift_lines: list[str] = []
-    for ev in run.execution_trace:
-        if ev.kind == "critic":
-            mark = "✅" if ev.payload.get("verdict") == "pass" else "❌"
-            critic_lines.append(
-                f"  {mark} {ev.node_id}: {_html.escape(str(ev.payload.get('reason', ''))[:120])}"
-            )
-        elif ev.kind == "alignment":
-            drift = float(ev.payload.get("drift", 0.0))
-            warn = "⚠️" if ev.payload.get("should_replan") else "·"
-            drift_lines.append(
-                f"  {warn} {ev.node_id}: drift={drift:.2f}"
-            )
-
-    diag: list[str] = []
-    if backend:
-        diag.append(f"<b>Runtime:</b> <code>{_html.escape(backend)}</code>")
-    if stage_lines:
-        diag.append("<b>Этапы:</b>\n" + "\n".join(stage_lines))
-    if critic_lines:
-        diag.append("<b>Critic verdicts:</b>\n" + "\n".join(critic_lines[:8]))
-    if drift_lines:
-        diag.append("<b>Goal alignment:</b>\n" + "\n".join(drift_lines[:8]))
-    diag.append(f"<b>Trace events:</b> {len(run.execution_trace)}")
-    diag.append(f"<b>Результат:</b> {_html.escape(str(outcome))}")
-    if reason:
-        diag.append(f"<b>Причина:</b> {_html.escape(str(reason))}")
-
-    if parts:
-        # Collapse the diagnostics behind a separator under the answer.
-        parts.append("━━━━━━━━━━━━━━\n<i>Диагностика:</i>\n\n" + "\n\n".join(diag))
-    else:
-        # Nothing synthesised — diagnostics IS the message.
-        parts.extend(diag)
-    return "\n\n".join(parts)
+        if len(synthesis) > 3900:
+            synthesis = synthesis[:3900]
+        return _md_to_html(synthesis)
+    # Fallback if no synthesis — show basic outcome
+    outcome = (run.result_summary or {}).get("outcome", "—")
+    return f"<i>{_html.escape(str(outcome))}</i>"
 
 
 @router.callback_query(F.data.startswith("task_approve:"))
@@ -2011,18 +1998,22 @@ async def on_task_approve(callback: CallbackQuery):
         )
         return
 
-    icon = "✅" if run.state == "done" else "❌"
-    final_text = f"{icon} <b>Задача завершена</b>\n\n{_render_run_summary(run)}"
-    # Telegram hard limit 4096; we already trim in _render_run_summary
-    # but the header adds ~30 chars — clip to 4000 just in case.
+    # Final: just the result, nothing else
+    final_text = _render_run_summary(run)
     if len(final_text) > 4000:
-        final_text = final_text[:4000] + "\n<i>…(обрезано)</i>"
+        final_text = final_text[:4000]
     try:
-        await status.edit_text(final_text, parse_mode=ParseMode.HTML)
+        await status.edit_text(
+            final_text,
+            reply_markup=platform_answer_keyboard(),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except TelegramBadRequest as e:
         logger.warning("final edit failed: %s", e)
-        # Fall back to sending as a new message
-        await callback.message.answer(final_text, parse_mode=ParseMode.HTML)
+        await callback.message.answer(
+            final_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
 
 
 @router.callback_query(F.data.startswith("task_reapprove:"))
