@@ -216,25 +216,30 @@ def platform_doc_keyboard(domain_idx: int, doc_idx: int) -> InlineKeyboardMarkup
 def file_tree_keyboard(
     path: str,
     subfolders: list,
+    page_files: list | None = None,
     page: int = 0,
     total_pages: int = 1,
     parent_path: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Navigation keyboard for a folder in the file tree.
 
-    Files are shown as hyperlinks in the message TEXT (not buttons).
-    The keyboard only has:
-    - 📂 subfolders (tap = enter)
-    - ➕ Папка
-    - ← page / → page (only when total_pages > 1, FR-42)
-    - ◀️ Назад
+    FR-46: files shown as [filename.pdf] buttons — tapping opens
+    the file form. Text in the message also shows [filename] in
+    <code> so user can copy-paste for [контекст] refs.
     """
     buttons = []
 
-    # Subfolders as buttons (files are in the text as hyperlinks)
+    # Subfolders
     for f in sorted(subfolders, key=lambda c: c.name):
         buttons.append([InlineKeyboardButton(
             text=f"📂 {f.name}",
+            callback_data=f"ftree:{f.path}",
+        )])
+
+    # Files as [filename] buttons (FR-46)
+    for f in (page_files or []):
+        buttons.append([InlineKeyboardButton(
+            text=f"[{f.name}]",
             callback_data=f"ftree:{f.path}",
         )])
 

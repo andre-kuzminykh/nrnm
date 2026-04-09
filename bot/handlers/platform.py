@@ -524,12 +524,12 @@ def _render_folder_text(tg_id: int, path: str, page: int = 0) -> str:
     lines.append(f"Файлов: {total}\n")
 
     if page_files:
-        lines.append("<b>Файлы:</b>")
         offset = page * file_tree_svc.PAGE_SIZE
         for i, f in enumerate(page_files, start=offset + 1):
-            # Each file is rendered as bold text. Tapping is done via
-            # the callback "ffile:<path>" — we'll register a handler.
-            lines.append(f"  {i}. 📄 <b>{_html.escape(f.name)}</b> ({f.num_chunks} фр.)")
+            # FR-46: [filename.pdf] format — user can copy-paste into
+            # messages for [контекст] refs. Displayed as code so it's
+            # visually distinct and easy to select/copy.
+            lines.append(f"  <code>[{_html.escape(f.name)}]</code>")
     else:
         lines.append("<i>Файлов нет. Отправьте файл в чат.</i>")
 
@@ -576,6 +576,7 @@ async def _show_folder(message, tg_id: int, path: str, page: int = 0):
     """Render a folder with file list + subfolders + pagination."""
     children = file_tree_svc.list_children(tg_id, path)
     subfolders = [c for c in children if c.is_folder]
+    page_files = file_tree_svc.list_files_page(tg_id, path, page=page)
     tp = file_tree_svc.total_pages(tg_id, path)
     parent_path = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
     if path == "/":
@@ -586,6 +587,7 @@ async def _show_folder(message, tg_id: int, path: str, page: int = 0):
         message, text,
         reply_markup=file_tree_keyboard(
             path, subfolders,
+            page_files=page_files,
             page=page, total_pages=tp,
             parent_path=parent_path,
         ),
