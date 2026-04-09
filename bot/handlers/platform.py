@@ -1993,23 +1993,20 @@ def _safe_html(text: str) -> str:
         text = re.sub(r"<[^>]+>", "", text)
         # Escape for Telegram HTML
         text = _html.escape(text)
-        # Source lines: [N] Title — URL → [N] <a href>Title</a>
+        # [N](url) → <a href="url">[N]</a>
         text = re.sub(
-            r"\[(\d+)\]\s+(.+?)\s*[—–\-]\s*(https?://[^\s]+)",
-            lambda m: (
-                f'<b>[{m.group(1)}]</b> '
-                f'<a href="{m.group(3).rstrip(".,;:!?")}">{m.group(2).strip()}</a>'
-            ),
+            r"\[(\d+)\]\(?(https?://[^\s)]+)\)?",
+            lambda m: f'<a href="{m.group(2).rstrip(".,;:!?")}">[{m.group(1)}]</a>',
             text,
         )
-        # Bare URLs that aren't already inside <a>
-        def _linkify_bare(m):
-            url = m.group(1).rstrip(".,;:!?)")
-            after = m.group(0)[len(m.group(1)):]
-            return f'<a href="{url}">{url}</a>{after}'
-        text = re.sub(r"(?<!href=\")(https?://[^\s<]+)", _linkify_bare, text)
-        # Bold [N] inline citations (skip those already inside <b> from source lines)
-        text = re.sub(r"(?<!<b>)\[(\d+)\](?!</b>)", r"<b>[\1]</b>", text)
+        # Bare URLs not already in <a href>
+        text = re.sub(
+            r"(?<!href=\")(https?://[^\s<]+)",
+            lambda m: f'<a href="{m.group(1).rstrip(".,;:!?")}">{m.group(1).rstrip(".,;:!?")}</a>',
+            text,
+        )
+        # Bold [N] only if NOT already inside an <a> tag
+        text = re.sub(r"(?<!\")\[(\d+)\](?!</a>)", r"<b>[\1]</b>", text)
     return text
 
 
@@ -2027,17 +2024,6 @@ def _md_to_html(text: str) -> str:
     """
     import re
 
-    # Pre-process: unwrap markdown links [text](url) → <a href>
-    # BUT only if text is NOT a number (those are citation markers)
-    def _md_link(m):
-        txt, url = m.group(1), m.group(2)
-        if txt.isdigit():
-            return m.group(0)  # keep [1](url) as-is — it's a citation
-        return f'{txt} <a href="{url}">{url}</a>'
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+?)\)", _md_link, text)
-    # Unwrap bare parenthesized URLs
-    text = re.sub(r"\((https?://[^)]+?)\)", r" \1 ", text)
-
     lines = text.split("\n")
     out: list[str] = []
     for line in lines:
@@ -2047,26 +2033,35 @@ def _md_to_html(text: str) -> str:
             out.append(f"<b>{_html.escape(m.group(1))}</b>")
             continue
 
-        # Source line: [N] Title — https://url → [N] <a href>Title</a>
-        m = re.match(r"^\s*\[(\d+)\]\s+(.+?)\s*[—–-]\s*(https?://\S+)\s*$", line)
-        if m:
-            num, title, url = m.group(1), m.group(2), m.group(3)
-            out.append(
-                f'<b>[{num}]</b> <a href="{_html.escape(url)}">'
-                f'{_html.escape(title)}</a>'
-            )
-            continue
+        # Handle [N](url) and [text](url) BEFORE escaping (they contain raw URLs)
+        # [N](url) → placeholder, [text](url) → placeholder
+        _link_store: list[str] = []
+        def _stash_link(m):
+            txt, url = m.group(1), m.group(2).rstrip(".,;:!?")
+            if re.match(r"^\d+$", txt):
+                html = f'<a href="{url}">[{txt}]</a>'
+            else:
+                html = f'<a href="{url}">{_html.escape(txt)}</a>'
+            idx = len(_link_store)
+            _link_store.append(html)
+            return f"\x00LINK{idx}\x00"
+        line = re.sub(r"\[([^\]]+)\]\((https?://[^)]+?)\)", _stash_link, line)
+        # Unwrap (https://...) parenthesized URLs
+        line = re.sub(r"\((https?://[^)]+?)\)", r" \1 ", line)
 
         esc = _html.escape(line)
         # **bold** → <b>bold</b>
         esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
-        # [N] inline citation → bold
-        esc = re.sub(r"\[(\d+)\]", r"<b>[\1]</b>", esc)
-        # Bare URLs → <a href> (careful with trailing punctuation)
+        # [N] without URL → bold fallback
+        esc = re.sub(r"(?<!\")\[(\d+)\](?!</a>)", r"<b>[\1]</b>", esc)
+        # Bare URLs → <a href> (BEFORE restoring link placeholders)
         def _linkify(m):
             url = m.group(1).rstrip(".,;:!?)")
             return f'<a href="{url}">{url}</a>'
-        esc = re.sub(r"(https?://[^\s<\"&]+)", _linkify, esc)
+        esc = re.sub(r"(https?://[^\s<\"&\x00]+)", _linkify, esc)
+        # NOW restore stashed [N](url) links
+        for idx, html in enumerate(_link_store):
+            esc = esc.replace(f"\x00LINK{idx}\x00", html)
         out.append(esc)
     return "\n".join(out)
 

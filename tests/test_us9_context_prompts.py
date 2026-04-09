@@ -132,25 +132,19 @@ def test_safe_html_relinkifies_after_strip():
     broken = (
         '<b>Title</b>\n'
         'Text <a href="https://example.com">link\n'  # unclosed <a>!
-        '[1] Source — https://source.com/report\n'
+        'Info [1](https://source.com/report) here.\n'
         'Bare https://bare.url/here end.'
     )
     result = _safe_html(broken)
-    # Should NOT contain unclosed tags
-    assert "<a>" not in result or "</a>" in result
-    # URLs should still be clickable hyperlinks
-    assert '<a href="https://source.com/report">' in result
+    # [1](url) → <a href>[1]</a>
+    assert '<a href="https://source.com/report">[1]</a>' in result
+    # Bare URL → <a href>
     assert '<a href="https://bare.url/here">' in result
-    # [1] should be bold
-    assert "<b>[1]</b>" in result
 
 
-def test_fr_44_md_to_html_handles_citations_and_sources():
-    """_md_to_html should:
-    - Bold [N] inline citations
-    - Convert source lines [N] Title — URL into hyperlinks
-    - Handle headings, bold, bare URLs
-    """
+def test_fr_44_md_to_html_citations_as_hyperlinks():
+    """_md_to_html should convert [N](url) into clickable <a href>[N]</a>.
+    No separate source list at the bottom."""
     try:
         from bot.handlers.platform import _md_to_html
     except ImportError:
@@ -158,24 +152,20 @@ def test_fr_44_md_to_html_handles_citations_and_sources():
 
     result = _md_to_html(
         "# Отчёт\n\n"
-        "Рынок вырос на 15% [1]. Лидеры: ABB, KUKA [2].\n"
+        "Рынок вырос на 15% [1](https://ifr.org/report). "
+        "Лидеры: ABB, KUKA [2](https://robotics.eu/review).\n"
         "Подробнее (https://example.com/details) здесь.\n"
-        "Также [см. отчёт](https://report.eu/2024).\n\n"
-        "[1] IFR Annual Report — https://ifr.org/report\n"
-        "[2] EU Robotics Review — https://robotics.eu/review"
+        "Также [см. отчёт](https://report.eu/2024)."
     )
     # Headings
     assert "<b>Отчёт</b>" in result
-    # Inline [1] → bold
-    assert "<b>[1]</b>" in result
-    assert "<b>[2]</b>" in result
-    # Source lines: [N] Title as hyperlink
-    assert '<a href="https://ifr.org/report">IFR Annual Report</a>' in result
-    assert '<a href="https://robotics.eu/review">EU Robotics Review</a>' in result
+    # [N](url) → <a href="url">[N]</a>
+    assert '<a href="https://ifr.org/report">[1]</a>' in result
+    assert '<a href="https://robotics.eu/review">[2]</a>' in result
+    # Regular markdown link
+    assert '<a href="https://report.eu/2024">см. отчёт</a>' in result
     # Parenthesized URL unwrapped
     assert "(https://example.com/details)" not in result
-    # Markdown link unwrapped
-    assert "](https://" not in result
 
 
 def test_fr_44_web_search_query_uses_history(monkeypatch):
