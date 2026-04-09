@@ -54,15 +54,14 @@ def test_fr_12_executor_follows_approved_graph_exactly(platform_svc, tg_id):
 # FR-13 — only Web Search + PDF Parser as tools in v1
 # ─────────────────────────────────────────────────────────────────
 
-def test_fr_13_only_two_tools_registered_in_v1():
-    """FR-13: в v1 в tool registry должны быть ровно два инструмента —
-    `web_search` и `pdf_parser`. `[контекст]` — это не обычный tool, а
-    встроенный механизм подключения Памяти (проверяется в FR-14)."""
+def test_fr_13_core_tools_registered():
+    """FR-13 + FR-47..50: tool registry must include core + agent tools."""
     tools = _tools_api()
     if tools is None:
         pytest.skip("TODO FR-13: Tool layer not implemented")
     registered = set(tools.list_tools())  # type: ignore[attr-defined]
-    assert registered == {"web_search", "pdf_parser"}
+    for name in ("web_search", "pdf_parser", "ask_user", "rag_search", "file_open"):
+        assert name in registered, f"{name} missing from tool registry"
 
 
 def test_fr_13_executor_rejects_disallowed_tool_call(platform_svc, tg_id):

@@ -111,7 +111,7 @@ def test_fr_24_new_domain_has_default_web_search_mcp(platform_svc, tg_id):
     assert "web_search" in names
     ws = reg.get_mcp(tg_id, "research", "web_search")
     assert ws.url.startswith("builtin://")
-    assert "search" in ws.description.lower() or "веб" in ws.description.lower()
+    assert "поиск" in ws.description.lower() or "search" in ws.description.lower()
 
 
 def test_fr_24_mcp_registries_are_isolated_across_domains(platform_svc, tg_id):

@@ -83,21 +83,34 @@ def _web_search_serpapi(query: str, num: int = 5) -> ToolCallResult:
         "api_key": config.SERPAPI_API_KEY,
         "num": num,
     }
-    try:
-        with httpx.Client(timeout=config.SERPAPI_TIMEOUT) as client:
-            resp = client.get(config.SERPAPI_ENDPOINT, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
-        logger.warning("SerpAPI HTTP error: %s", exc)
+    import time as _time
+
+    last_err = ""
+    data = None
+    for attempt in range(1, 4):  # 3 attempts
+        try:
+            with httpx.Client(timeout=config.SERPAPI_TIMEOUT) as client:
+                resp = client.get(config.SERPAPI_ENDPOINT, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            last_err = f"serpapi timeout (attempt {attempt}/3): {exc}"
+            logger.warning("SerpAPI timeout attempt %d/3: %s", attempt, exc)
+            if attempt < 3:
+                _time.sleep(1.0 * attempt)
+        except httpx.HTTPError as exc:
+            last_err = f"serpapi http: {exc}"
+            logger.warning("SerpAPI HTTP error: %s", exc)
+            break  # non-timeout HTTP errors don't retry
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"serpapi: {exc}"
+            logger.warning("SerpAPI unexpected: %s", exc)
+            break
+
+    if data is None:
         return ToolCallResult(
-            status="error", error=f"serpapi http: {exc}",
-            metadata={"tool": "web_search", "provider": "serpapi", "query": query},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("SerpAPI unexpected: %s", exc)
-        return ToolCallResult(
-            status="error", error=f"serpapi: {exc}",
+            status="error", error=last_err,
             metadata={"tool": "web_search", "provider": "serpapi", "query": query},
         )
 
@@ -159,14 +172,154 @@ def _pdf_parser(content: str | bytes = "", **_: Any) -> ToolCallResult:
     )
 
 
+# ── FR-47: ask_user — pause execution and ask the user ──────────
+
+def _ask_user(question: str = "", **_: Any) -> ToolCallResult:
+    """Returns status='pending' — the runtime interprets this as
+    'pause the graph and wait for user input'. The bot handler
+    prompts the user, collects the response, and feeds it back
+    into the graph state before resuming."""
+    return ToolCallResult(
+        status="pending",
+        output={"question": question or "Уточните, пожалуйста."},
+        metadata={"tool": "ask_user"},
+    )
+
+
+# ── FR-48: rag_search — query the internal RAG database ─────────
+
+def _rag_search(query: str = "", tg_id: int = 0, **_: Any) -> ToolCallResult:
+    """Synchronous wrapper around rag.query_rag. Searches across all
+    active domains for the given user. Returns top-k hits with text
+    fragments — same shape as web_search hits for uniformity."""
+    if not query:
+        return ToolCallResult(status="error", error="empty query", metadata={"tool": "rag_search"})
+
+    import asyncio
+
+    try:
+        from services import rag, platform as platform_svc
+
+        active = platform_svc.get_active_domains(tg_id)
+        if not active:
+            return ToolCallResult(
+                status="ok",
+                output={"hits": [], "note": "no active domains"},
+                metadata={"tool": "rag_search", "query": query},
+            )
+
+        all_hits: list[dict] = []
+        for dom in active:
+            col = platform_svc.collection_name(tg_id, dom)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        hits = pool.submit(asyncio.run, rag.query_rag(col, query, top_k=5)).result()
+                else:
+                    hits = asyncio.run(rag.query_rag(col, query, top_k=5))
+            except Exception:  # noqa: BLE001
+                hits = []
+            all_hits.extend(hits)
+
+        all_hits.sort(key=lambda h: -h.get("score", 0))
+        top = all_hits[:5]
+        return ToolCallResult(
+            status="ok",
+            output={"hits": [
+                {"title": h.get("filename", ""), "text": h.get("text", ""), "score": h.get("score", 0)}
+                for h in top
+            ]},
+            metadata={"tool": "rag_search", "query": query},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ToolCallResult(
+            status="error", error=f"rag_search: {exc}",
+            metadata={"tool": "rag_search", "query": query},
+        )
+
+
+# ── FR-49: file_open — read a file, summarize if too large ──────
+
+def _file_open(
+    filename: str = "",
+    tg_id: int = 0,
+    max_chars: int = 20_000,
+    **_: Any,
+) -> ToolCallResult:
+    """Open a file from the user's file tree by name. If the content
+    exceeds max_chars, runs map-reduce summarization via
+    context_resolver so the whole file fits in the LLM context."""
+    if not filename:
+        return ToolCallResult(status="error", error="no filename", metadata={"tool": "file_open"})
+
+    try:
+        from services import file_tree as ft, memory as mem
+        from services import context_resolver
+
+        # Search the file tree for a matching filename
+        all_files = ft.get_scope(tg_id, "/")
+        match = None
+        for f in all_files:
+            if f.name == filename or f.path.endswith(f"/{filename}"):
+                match = f
+                break
+        if match is None:
+            # Fuzzy: try substring
+            for f in all_files:
+                if filename.lower() in f.name.lower():
+                    match = f
+                    break
+        if match is None:
+            return ToolCallResult(
+                status="error",
+                error=f"file '{filename}' not found in tree",
+                metadata={"tool": "file_open", "filename": filename},
+            )
+
+        raw = mem.get_object_content(match.doc_id)
+        if not raw:
+            return ToolCallResult(
+                status="ok",
+                output={"content": "", "filename": match.name, "summarized": False,
+                        "note": "file content empty or not cached"},
+                metadata={"tool": "file_open", "filename": match.name},
+            )
+
+        if len(raw) <= max_chars:
+            return ToolCallResult(
+                status="ok",
+                output={"content": raw, "filename": match.name, "summarized": False},
+                metadata={"tool": "file_open", "filename": match.name},
+            )
+
+        # Too large — summarize via map-reduce (NFR-13)
+        ctx = context_resolver.assemble_full_context(tg_id, [match.doc_id], max_chars=max_chars)
+        summary = ctx.objects[0].content if ctx.objects else raw[:max_chars]
+        return ToolCallResult(
+            status="ok",
+            output={"content": summary, "filename": match.name, "summarized": True},
+            metadata={"tool": "file_open", "filename": match.name},
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ToolCallResult(
+            status="error", error=f"file_open: {exc}",
+            metadata={"tool": "file_open", "filename": filename},
+        )
+
+
 _TOOLS: dict[str, Callable[..., ToolCallResult]] = {
     "web_search": _web_search,
     "pdf_parser": _pdf_parser,
+    "ask_user": _ask_user,
+    "rag_search": _rag_search,
+    "file_open": _file_open,
 }
 
 
 def list_tools() -> set[str]:
-    """FR-13: registry contains exactly {web_search, pdf_parser}."""
+    """All registered tools available to the superagent planner."""
     return set(_TOOLS.keys())
 
 

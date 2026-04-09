@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 _BUILTIN_ROUTES: dict[str, str] = {
     "builtin://serpapi": "web_search",
     "builtin://pdf_parser": "pdf_parser",
+    "builtin://rag_search": "rag_search",
+    "builtin://file_open": "file_open",
+    "builtin://ask_user": "ask_user",
 }
 
 

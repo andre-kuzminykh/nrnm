@@ -477,6 +477,17 @@ def _execute_step_with_retries(
                 },
             ))
 
+            if result.status == "pending":
+                # FR-47: ask_user — pause execution
+                progress("tool_call_done", {
+                    "tool": step.tool,
+                    "status": "pending",
+                    "question": (result.output or {}).get("question", ""),
+                    "attempt": attempt,
+                })
+                # Store the question so the bot can show it
+                return {"pending": True, "question": (result.output or {}).get("question", "")}
+
             if result.status == "ok":
                 progress("tool_call_done", {
                     "tool": step.tool,
@@ -561,9 +572,16 @@ def _synthesize_step(step: PlanStep, state: GraphState) -> Any:
         "You are the final-step synthesiser in a multi-step agent. "
         "Combine the prior step outputs into a clean, useful answer "
         "for the user's goal. Write in the same language as the goal. "
-        "Use markdown headers/bullets if helpful. Keep it concrete: "
-        "cite filenames or source titles inline when they appear in "
-        "the prior outputs. Do NOT add [1], [2] citation numbers. "
+        "Use markdown headers/bullets if helpful. Keep it concrete.\n\n"
+        "IMPORTANT — citation format:\n"
+        "- When you use information from a source, put its number in "
+        "square brackets right after the statement: 'Рынок вырос на 15% [1].'\n"
+        "- At the END of your answer, add a numbered list of sources:\n"
+        "  [1] Title of source — https://url\n"
+        "  [2] Title of source — https://url\n"
+        "- Each source: number, title as text, dash, URL.\n"
+        "- The title should be the article/page title from the search result.\n"
+        "- Only list sources you actually cited in the text.\n"
         "If prior outputs are thin, say so honestly and summarise "
         "what you do have."
     )

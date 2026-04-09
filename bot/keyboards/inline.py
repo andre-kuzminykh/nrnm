@@ -22,33 +22,35 @@ def platform_menu_keyboard(
     active_mode: str = "chat",
     active_instrument: str = "chat",
 ) -> InlineKeyboardMarkup:
-    """FR-28 / FR-30 / FR-31: main platform widget.
+    """Main platform widget.
 
     Layout (top to bottom):
-    1. **Instrument picker row** — three instruments in a row:
-       💬 Чат | 🔍 Файлы | 🌐 Веб. Active one marked with ✅.
-    2. **🤖 СУПЕРАГЕНТ** — big standalone button (FR-31). Starts the
-       full LangGraph pipeline with goal input.
+    1. **🧠 СУПЕРАГЕНТ** — biggest, topmost (FR-31 + user request)
+    2. **Instrument picker row** — 💬 Чат | 📁 Память | 🌐 Веб
     3. **🤖 Model picker**
-    4. **💾 Память** — under the instrument block (FR-30).
-    5. **🔄 Сбросить контекст**
-    6. **◀️ Главное меню**
+    4. (if instrument = file_search) **📁 Домен(ы)** — domain selector
 
-    `active_mode` is accepted for backwards compat but mapped to
-    `active_instrument` internally. New code should pass
-    `active_instrument` directly.
+    No 🔄 Сбросить контекст here — it lives inline under each answer.
     """
-    # Backwards compat: map old mode names to instruments
     if active_instrument == "chat" and active_mode != "chat":
         active_instrument = active_mode
 
     model_label = active_model or "не выбрана"
-    doms = ", ".join(active_domains) if active_domains else "не выбран"
 
-    # Instrument picker row
+    # Domain label for the memory instrument
+    n_doms = len(active_domains)
+    if n_doms == 0:
+        dom_label = "не выбран"
+    elif n_doms == 1:
+        dom_label = active_domains[0]
+    else:
+        dom_label = ", ".join(active_domains)
+    dom_button_text = f"📁 Домен: {dom_label}" if n_doms <= 1 else f"📁 Домены: {dom_label}"
+
+    # Instrument picker: Чат | Память | Веб  (Агент is a separate top row)
     instruments = [
         ("chat", "💬", "Чат"),
-        ("file_search", "🔍", "Файлы"),
+        ("file_search", "📁", "Память"),
         ("web_search", "🌐", "Веб"),
     ]
     inst_buttons = []
@@ -61,28 +63,22 @@ def platform_menu_keyboard(
             )
         )
 
+    agent_mark = "✅ " if active_instrument == "superagent" else ""
     rows = [
-        inst_buttons,
         [InlineKeyboardButton(
-            text="🤖 СУПЕРАГЕНТ",
-            callback_data="platform_superagent",
+            text=f"{agent_mark}🧠 СУПЕРАГЕНТ",
+            callback_data="platform_instrument:superagent",
         )],
+        inst_buttons,
         [InlineKeyboardButton(text=f"🤖 {model_label}", callback_data="platform_model")],
     ]
 
-    # FR-30: Memory button only visible when file_search is active —
-    # other instruments don't need domain selection.
+    # File tree selector only for the "Память" (file_search) instrument
     if active_instrument == "file_search":
         rows.append([InlineKeyboardButton(
-            text=f"💾 Память: {doms}",
-            callback_data="platform_memory",
+            text="📁 Файлы",
+            callback_data="ftree:/",
         )])
-
-    rows.append([InlineKeyboardButton(
-        text="🔄 Сбросить контекст",
-        callback_data="platform_reset",
-    )])
-    # No "◀️ Главное меню" — this widget IS the main menu.
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -113,17 +109,22 @@ def task_reapproval_keyboard(session_id: str) -> InlineKeyboardMarkup:
 
 
 def platform_answer_keyboard(saved: bool = False) -> InlineKeyboardMarkup:
-    """FR-P12 / FR-P19: per-answer «сохранить в память» button.
-    When `saved=True` the button label becomes «✅ Сохранено в память» and
-    its callback is `noop` so additional taps do nothing."""
+    """Per-answer inline keyboard. Every response gets two buttons:
+
+    1. 💾 Сохранить в память / ✅ Сохранено — save the answer as a
+       new versioned document in the active domain.
+    2. 🔄 Обновить контекст — clears chat history so subsequent
+       messages start fresh. Replaces the old widget-level reset
+       button — context reset belongs here, next to the content it
+       affects, not on the static main menu.
+    """
     if saved:
-        label = "✅ Сохранено в память"
-        cb = "platform_save_noop"
+        save_btn = InlineKeyboardButton(text="✅", callback_data="platform_save_noop")
     else:
-        label = "💾 Сохранить в память"
-        cb = "platform_save_answer"
+        save_btn = InlineKeyboardButton(text="💾", callback_data="platform_save_answer")
+    reset_btn = InlineKeyboardButton(text="🔄", callback_data="platform_reset")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=label, callback_data=cb)],
+        [save_btn, reset_btn],
     ])
 
 
@@ -207,6 +208,76 @@ def platform_doc_keyboard(domain_idx: int, doc_idx: int) -> InlineKeyboardMarkup
                               callback_data=f"platform_doc_delete:{domain_idx}:{doc_idx}")],
         [InlineKeyboardButton(text="◀️ Назад",
                               callback_data=f"platform_domain_open:{domain_idx}")],
+    ])
+
+
+# ── FR-39..43: File tree keyboards ────────────────────────────────
+
+def file_tree_keyboard(
+    path: str,
+    subfolders: list,
+    page_files: list | None = None,
+    page: int = 0,
+    total_pages: int = 1,
+    parent_path: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Navigation keyboard for a folder in the file tree.
+
+    FR-46: files shown as [filename.pdf] buttons — tapping opens
+    the file form. Text in the message also shows [filename] in
+    <code> so user can copy-paste for [контекст] refs.
+    """
+    buttons = []
+
+    # Subfolders
+    for f in sorted(subfolders, key=lambda c: c.name):
+        buttons.append([InlineKeyboardButton(
+            text=f"📂 {f.name}",
+            callback_data=f"ftree:{f.path}",
+        )])
+
+    # Files as [filename] buttons (FR-46)
+    for f in (page_files or []):
+        buttons.append([InlineKeyboardButton(
+            text=f"[{f.name}]",
+            callback_data=f"ftree:{f.path}",
+        )])
+
+    # Action row
+    action_row = [InlineKeyboardButton(text="➕ Папка", callback_data=f"ftree_mkdir:{path}")]
+    buttons.append(action_row)
+
+    # Pagination (FR-42): only when >1 page
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"ftree_page:{path}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"ftree_page:{path}:{page + 1}"))
+        buttons.append(nav)
+
+    # Back
+    if parent_path is not None:
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ftree:{parent_path}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="◀️ К меню", callback_data="platform_menu")])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def file_context_keyboard(file_path: str, parent_path: str) -> InlineKeyboardMarkup:
+    """Keyboard shown when user enters a single file context.
+    They can chat within this file's scope or go back."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🗑 Удалить файл",
+            callback_data=f"ftree_delete:{file_path}",
+        )],
+        [InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data=f"ftree:{parent_path}",
+        )],
     ])
 
 
