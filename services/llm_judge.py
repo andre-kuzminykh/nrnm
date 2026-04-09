@@ -53,6 +53,31 @@ class Alignment:
     provider: str = "stub"
 
 
+@dataclass
+class ProcessVerdict:
+    """Decision by the process-level critic after a step-level critic
+    has vetoed a step. The process critic looks at the BIGGER picture:
+
+    - What's the overall goal?
+    - What have we already accumulated from earlier steps?
+    - What specifically did the step critic complain about?
+    - Is that complaint blocking progress, or just a quality concern?
+
+    Actions:
+    - "continue"   — treat the step as soft-pass. Accumulate the
+                     step critic's complaint as a `concern` so the
+                     final synthesis step knows about it, but keep
+                     the runtime moving.
+    - "abort"      — the step critic was right and we genuinely
+                     can't proceed. Set replan_signal=critic_failed
+                     and let the modes layer redesign.
+    """
+    action: str  # "continue" | "abort"
+    reason: str
+    concern: str = ""
+    provider: str = "stub"
+
+
 # Drift threshold above which alignment recommends a replan. The runtime
 # can override per-call but for v1.1 a single global value is enough.
 DRIFT_THRESHOLD = 0.6
@@ -96,15 +121,25 @@ def critic(
 
 
 _CRITIC_PROMPT = """\
-You are a strict reviewer. Given a step, its expected result, the
-actual result, and the original goal — decide whether the step passed.
+You are a lenient-but-honest reviewer. Your job: decide whether the
+actual result of a plan step plausibly contributes toward the user's
+goal — not whether it's perfect or complete.
 
 Return JSON ONLY, schema:
 {"verdict": "pass" | "fail", "reason": "...", "confidence": 0.0..1.0}
 
-Pass = actual result satisfies expected and contributes to the goal.
-Fail = result is empty / wrong / off-topic / clearly insufficient.
-Be strict; when unsure → fail.
+DEFAULT TO PASS. A messy-but-relevant web_search result with real
+hits PASSES. A plausible pdf extraction PASSES. A partially-filled
+table PASSES. The synthesis / final step can always polish incomplete
+data downstream.
+
+FAIL only when the result is one of:
+- empty / null / zero hits
+- an error message or exception trace
+- completely off-topic (doesn't mention the goal at all)
+- explicitly wrong or contradictory to the acceptance_criteria
+
+When in doubt → pass. Verbose but relevant > clean but empty.
 """
 
 
@@ -275,6 +310,165 @@ def _alignment_stub(
         reason=f"overlap={overlap:.2f} (stub capped)",
         provider="stub",
     )
+
+
+# ── process critic ───────────────────────────────────────────────
+
+
+def process_critic(
+    *,
+    goal: str,
+    step_description: str,
+    step_result: Any,
+    critic_reason: str,
+    prior_results: dict[str, Any],
+) -> ProcessVerdict:
+    """When the step-level critic vetoes a step, this higher-level
+    critic decides whether to *continue with partial data* or *abort
+    the run*. It's the difference between "this step is imperfect but
+    we still have useful data" and "the whole approach is broken".
+
+    Defaults to `continue` because the step critic is already
+    lenient; if it still said fail, that usually means "the result
+    is a bit weaker than expected" not "everything is on fire".
+    """
+    if config.LLM_API_KEY:
+        try:
+            return _process_critic_llm(
+                goal=goal,
+                step_description=step_description,
+                step_result=step_result,
+                critic_reason=critic_reason,
+                prior_results=prior_results,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("process_critic LLM failed, falling back to stub: %s", exc)
+
+    return _process_critic_stub(
+        goal=goal,
+        step_description=step_description,
+        step_result=step_result,
+        critic_reason=critic_reason,
+        prior_results=prior_results,
+    )
+
+
+_PROCESS_CRITIC_PROMPT = """\
+You are the process-level critic in a multi-step agent. The
+step-level critic just vetoed a step. Your job: decide whether the
+run should CONTINUE with the partial result (carrying the complaint
+as a concern for the final synthesis) or ABORT so the pipeline can
+redesign the plan.
+
+Return JSON ONLY, schema:
+{"action": "continue" | "abort", "reason": "...", "concern": "..."}
+
+Default to CONTINUE when:
+- the step produced SOME data (even messy / incomplete)
+- earlier steps already accumulated useful material
+- the complaint is about quality, not total failure
+- a replan would likely hit the same problem
+
+Prefer ABORT only when:
+- the step produced nothing usable AND earlier steps are also empty
+- the approach itself is clearly wrong for the goal
+- the tool / data source is unavailable and can't be worked around
+- continuing would produce a misleading or false final answer
+
+"concern" is a 1-line note the final synthesis step will see, so it
+can acknowledge the gap (e.g. "company list is incomplete, source
+is aggregator pages only"). Write it in the same language as the goal.
+"""
+
+
+def _process_critic_llm(
+    *,
+    goal: str,
+    step_description: str,
+    step_result: Any,
+    critic_reason: str,
+    prior_results: dict[str, Any],
+) -> ProcessVerdict:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
+    prior_summary = {
+        k: _stringify(v)[:400] for k, v in (prior_results or {}).items()
+    }
+    user = (
+        f"Goal: {goal}\n"
+        f"Failing step: {step_description}\n"
+        f"Step critic complaint: {critic_reason}\n"
+        f"Step actual result: {json.dumps(step_result, ensure_ascii=False, default=str)[:1500]}\n"
+        f"Prior steps that already completed:\n{json.dumps(prior_summary, ensure_ascii=False)[:1500]}"
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": _PROCESS_CRITIC_PROMPT},
+            {"role": "user", "content": user},
+        ],
+    )
+    data = json.loads(resp.choices[0].message.content or "{}")
+    action = data.get("action")
+    if action not in ("continue", "abort"):
+        action = "continue"  # lenient default
+    return ProcessVerdict(
+        action=action,
+        reason=str(data.get("reason") or ""),
+        concern=str(data.get("concern") or critic_reason),
+        provider="openai",
+    )
+
+
+def _process_critic_stub(
+    *,
+    goal: str,
+    step_description: str,
+    step_result: Any,
+    critic_reason: str,
+    prior_results: dict[str, Any],
+) -> ProcessVerdict:
+    """Lenient default: continue unless the result is clearly nothing.
+
+    Aborts only when BOTH the failing step AND all prior steps have
+    empty / error results — i.e. there's literally nothing to
+    synthesise from.
+    """
+    def _is_empty(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, dict):
+            if v.get("error"):
+                return True
+            if "hits" in v and not v["hits"]:
+                return True
+            if "text" in v and not v["text"]:
+                return True
+            return len(v) == 0
+        return not v
+
+    step_empty = _is_empty(step_result)
+    all_prior_empty = all(_is_empty(v) for v in (prior_results or {}).values())
+
+    if step_empty and all_prior_empty:
+        return ProcessVerdict(
+            action="abort",
+            reason="step empty and no prior data to synthesise from",
+            concern=critic_reason,
+            provider="stub",
+        )
+    return ProcessVerdict(
+        action="continue",
+        reason="partial data usable for synthesis",
+        concern=critic_reason,
+        provider="stub",
+    )
+
+
+# ── helpers ──────────────────────────────────────────────────────
 
 
 def _tokenise(text: str) -> list[str]:

@@ -22,6 +22,8 @@ import asyncio
 import html as _html
 import io
 import logging
+import queue as _queue
+import time as _time
 import uuid
 from dataclasses import dataclass
 
@@ -38,6 +40,7 @@ from services import modes as modes_svc
 from services import context_resolver
 from services import memory as memory_svc
 from services import mcp_registry
+from services import instruments as instruments_svc
 from bot.keyboards.inline import (
     platform_menu_keyboard,
     platform_model_keyboard,
@@ -106,30 +109,44 @@ def _mode_label(mode: str) -> str:
     return {"chat": "💬 Чат", "task": "🎯 Задачи"}.get(mode, mode)
 
 
+def _instrument_hint(instrument: str) -> str:
+    """Short contextual hint shown in the main widget depending on
+    the active instrument."""
+    hints = {
+        "chat": (
+            "Просто пишите — отвечу с диалогом и историей.\n"
+            "Подключайте файл через <code>[имя_файла]</code> или "
+            "<code>[имя@v2]</code>.\n"
+            "<i>Память (RAG) не используется — только LLM + контекст.</i>"
+        ),
+        "file_search": (
+            "Введите запрос — поищу ответ по выбранным доменам (RAG).\n"
+            "Выберите домены в «💾 Память» ниже."
+        ),
+        "web_search": (
+            "Введите запрос — поищу актуальную информацию "
+            "через SerpAPI. Ссылки будут кликабельные."
+        ),
+    }
+    return hints.get(instrument, hints["chat"])
+
+
 def _menu_text(user: platform_svc.PlatformUser, tg_id: int | None = None) -> str:
     active = platform_svc.get_active_domains_for(user)
-    mode = modes_svc.get_mode(tg_id) if tg_id is not None else "chat"
+    instrument = instruments_svc.get_active(tg_id) if tg_id is not None else "chat"
+    inst_obj = instruments_svc.get_instrument(instrument)
+    inst_label = f"{inst_obj.icon} {inst_obj.label}" if inst_obj else instrument
     text = (
         "🧠 <b>ИИ-платформа</b>\n\n"
-        f"<b>Режим:</b> {_mode_label(mode)}\n"
+        f"<b>Инструмент:</b> {inst_label}\n"
         f"<b>Модель:</b> {_html.escape(_model_label(user.model_id))}\n"
         f"<b>Домены:</b> {_html.escape(', '.join(active) or 'не выбраны')}\n\n"
+        f"<i>{_instrument_hint(instrument)}</i>"
     )
-    if mode == "chat":
-        text += (
-            "<i>Отправьте сообщение — отвечу с учётом Памяти.\n"
-            "Подключайте файл целиком через <code>[имя_файла]</code> или "
-            "<code>[имя@v2]</code>. Файл — в чат для загрузки в Память.</i>"
-        )
-    else:
-        text += (
-            "<i>Опишите цель — я построю полный план и покажу его "
-            "перед выполнением. План нужно подтвердить.</i>"
-        )
-    if not rag.is_configured():
+    if not rag.is_configured() and instrument == "file_search":
         text += "\n\n<i>⚠️ RAG не сконфигурирован (QDRANT_URL).</i>"
-    if not active and mode == "chat":
-        text += "\n\n<i>ℹ️ Выберите домен в «💾 Память» чтобы начать диалог.</i>"
+    if not active and instrument == "file_search":
+        text += "\n\n<i>ℹ️ Выберите домен в «💾 Память» чтобы начать RAG-поиск.</i>"
     return text
 
 
@@ -154,53 +171,117 @@ async def on_platform_menu(callback: CallbackQuery):
         reply_markup=platform_menu_keyboard(
             _model_label(user.model_id),
             platform_svc.get_active_domains(tg_id),
-            active_mode=modes_svc.get_mode(tg_id),
+            active_instrument=instruments_svc.get_active(tg_id),
         ),
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
 
 
-# ── FR-6 / FR-9 / Rule 2: mode toggle ────────────────────────────
+# ── FR-28: instrument picker ──────────────────────────────────────
 
-@router.callback_query(F.data.startswith("platform_mode:"))
-async def on_platform_mode_switch(callback: CallbackQuery):
-    mode = callback.data.split(":", 1)[1]
+@router.callback_query(F.data.startswith("platform_instrument:"))
+async def on_platform_instrument_switch(callback: CallbackQuery):
+    name = callback.data.split(":", 1)[1]
     try:
-        modes_svc.set_mode(callback.from_user.id, mode)
+        instruments_svc.set_active(callback.from_user.id, name)
     except ValueError as e:
         await callback.answer(str(e), show_alert=True)
         return
-    await callback.answer(f"Режим: {_mode_label(mode)}")
+    inst = instruments_svc.get_instrument(name)
+    label = f"{inst.icon} {inst.label}" if inst else name
+    await callback.answer(f"Инструмент: {label}")
     await on_platform_menu(callback)
 
 
+# ── FR-31: СУПЕРАГЕНТ entry point ────────────────────────────────
+
+@router.callback_query(F.data == "platform_superagent")
+async def on_platform_superagent(callback: CallbackQuery):
+    """Big button → ask for a goal, then build LangGraph plan.
+
+    Sets a dedicated wait state so the NEXT text message from this
+    user becomes the goal for _handle_task_goal. Any other interaction
+    (button taps, file uploads) is handled normally — the wait state
+    only intercepts plain text.
+    """
+    tg_id = callback.from_user.id
+    modes_svc.set_mode(tg_id, "task")
+    _set_wait(tg_id, "platform_superagent")
+    try:
+        await callback.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    await callback.message.bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=(
+            "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
+            "Опишите задачу одним сообщением.\n\n"
+            "Я построю план (шаги, параллели, инструменты), "
+            "покажу его, и после подтверждения выполню step-by-step "
+            "с критикой каждого шага.\n\n"
+            "💡 Подключайте файлы из Памяти: <code>[имя]</code> или "
+            "<code>[имя@v2]</code>"
+        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="platform_menu")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer("Введите задачу")
+
+
+# ── Legacy command shortcuts (kept for keyboard convenience) ─────
+
 @router.message(Command("chat"))
 async def cmd_chat(message: Message):
-    modes_svc.set_mode(message.from_user.id, "chat")
+    instruments_svc.set_active(message.from_user.id, "chat")
     await message.answer(
-        f"✅ Режим: <b>{_mode_label('chat')}</b>\n\n"
+        "✅ Инструмент: <b>💬 Чат</b>\n\n"
         "Пишите вопрос — отвечу с учётом Памяти.",
         parse_mode=ParseMode.HTML,
     )
 
 
-@router.message(Command("task"))
-async def cmd_task(message: Message):
-    modes_svc.set_mode(message.from_user.id, "task")
+@router.message(Command("search"))
+async def cmd_search(message: Message):
+    instruments_svc.set_active(message.from_user.id, "file_search")
     await message.answer(
-        f"✅ Режим: <b>{_mode_label('task')}</b>\n\n"
-        "Опишите цель — построю план и покажу перед выполнением.",
+        "✅ Инструмент: <b>🔍 Поиск по файлам</b>\n\n"
+        "Введите запрос — поищу в выбранных доменах.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("web"))
+async def cmd_web(message: Message):
+    instruments_svc.set_active(message.from_user.id, "web_search")
+    await message.answer(
+        "✅ Инструмент: <b>🌐 Веб-поиск</b>\n\n"
+        "Введите запрос — поищу актуальную информацию в вебе.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("agent"))
+async def cmd_agent(message: Message):
+    modes_svc.set_mode(message.from_user.id, "task")
+    _set_wait(message.from_user.id, "platform_superagent")
+    await message.answer(
+        "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
+        "Опишите задачу — построю план и выполню step-by-step.",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(Command("mode"))
 async def cmd_mode(message: Message):
-    mode = modes_svc.get_mode(message.from_user.id)
+    inst = instruments_svc.get_active(message.from_user.id)
+    inst_obj = instruments_svc.get_instrument(inst)
+    label = f"{inst_obj.icon} {inst_obj.label}" if inst_obj else inst
     await message.answer(
-        f"Текущий режим: <b>{_mode_label(mode)}</b>\n\n"
-        "Переключение: /chat или /task",
+        f"Текущий инструмент: <b>{label}</b>\n\n"
+        "Переключение: /chat, /search, /web, /agent",
         parse_mode=ParseMode.HTML,
     )
 
@@ -795,6 +876,12 @@ async def platform_handle_message(message: Message) -> bool:
         if handled:
             return True
 
+    # 0b. СУПЕРАГЕНТ goal input — next text becomes the task goal
+    if wait == "platform_superagent" and message.text:
+        _set_wait(tg_id, "platform")
+        await _handle_task_goal(message)
+        return True
+
     # 1. New domain name input
     if wait == "new_domain" and message.text:
         name = message.text.strip()
@@ -815,21 +902,162 @@ async def platform_handle_message(message: Message) -> bool:
         )
         return True
 
-    # 2. Platform — route by active mode
+    # 2. Platform — route by active INSTRUMENT (FR-28)
     if wait == "platform":
         if message.document:
             await _ingest_file(message)
             return True
         if not message.text:
             return True
-        mode = modes_svc.get_mode(tg_id)
-        if mode == "task":
-            await _handle_task_goal(message)
-        else:
+        instrument = instruments_svc.get_active(tg_id)
+        if instrument == "web_search":
+            await _handle_web_search(message)
+        elif instrument == "file_search":
             await _handle_rag_chat(message)
+        else:
+            # "chat" = pure LLM with history, NO RAG lookup.
+            # [filename] refs still work (pulled from Memory).
+            await _handle_pure_chat(message)
         return True
 
     return False
+
+
+# ── FR-28: pure chat instrument (no RAG, just LLM + history) ────
+
+async def _handle_pure_chat(message: Message) -> None:
+    """Chat instrument — pure conversational LLM with dialog history.
+
+    Does NOT search RAG/Qdrant. Does NOT require active domains.
+    [filename] refs are still resolved and injected as full context.
+    """
+    tg_id = message.from_user.id
+    user = platform_svc.get_user(tg_id)
+    question = message.text or ""
+    platform_svc.add_chat_message(tg_id, "user", question)
+
+    # FR-4: resolve [filename] / [file@v2] refs and pull full content
+    explicit_refs = context_resolver.parse_context_refs(question)
+    explicit_context_block = ""
+    if explicit_refs:
+        resolved_ids: list[str] = []
+        for ref in explicit_refs:
+            res = context_resolver.resolve_context_ref(tg_id, ref.name)
+            if res.matched is not None:
+                eid = (
+                    getattr(res.matched, "doc_id", None)
+                    or getattr(res.matched, "memory_object_id", None)
+                )
+                if eid:
+                    resolved_ids.append(eid)
+        if resolved_ids:
+            bundle = context_resolver.assemble_full_context(tg_id, resolved_ids)
+            chunks: list[str] = []
+            for obj in bundle.objects:
+                if not obj.content:
+                    continue
+                marker = "[СВОД]" if obj.used_summarization else "[ПОЛНЫЙ ФАЙЛ]"
+                chunks.append(f"{marker} {obj.filename}\n{obj.content}")
+            if chunks:
+                explicit_context_block = "\n\n---\n\n".join(chunks)
+
+    messages = [{
+        "role": "system",
+        "content": (
+            "Ты — ИИ-помощник. Отвечай кратко и по делу. "
+            "Если пользователь подключил файл через [имя] — секция "
+            "[ПОЛНЫЙ ФАЙЛ] или [СВОД] содержит его содержимое, используй "
+            "его как основной источник. "
+            "Никогда не ставь маркеры [1], [2]. "
+            "Если контекста нет — просто общайся."
+        ),
+    }]
+    messages.extend(user.chat_history[-10:-1])
+
+    user_content = question
+    if explicit_context_block:
+        user_content = f"Контекст:\n{explicit_context_block}\n\nВопрос: {question}"
+
+    messages.append({"role": "user", "content": user_content})
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
+        resp = await client.chat.completions.create(
+            model=user.model_id, messages=messages, temperature=0.3,
+        )
+        answer = resp.choices[0].message.content or "(пусто)"
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(f"❌ Ошибка LLM: {exc}")
+        return
+
+    platform_svc.add_chat_message(tg_id, "assistant", answer)
+    answer_html = _render_answer_with_hyperlinks(answer)
+    await message.answer(
+        f"💬 <b>{_html.escape(_model_label(user.model_id))}</b>\n\n{answer_html}",
+        reply_markup=platform_answer_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+# ── FR-28: web_search instrument handler ─────────────────────────
+
+async def _handle_web_search(message: Message) -> None:
+    """Web search instrument — calls SerpAPI via MCP and shows results
+    with clickable hyperlinks (FR-36)."""
+    tg_id = message.from_user.id
+    query = (message.text or "").strip()
+    if not query:
+        return
+
+    status = await message.answer("🌐 Ищу в вебе…")
+    try:
+        from services import mcp_registry, mcp_client
+
+        # Look up web_search MCP in the first active domain
+        active = platform_svc.get_active_domains(tg_id)
+        domain = active[0] if active else None
+        entry = None
+        if domain:
+            entry = mcp_registry.get_mcp(tg_id, domain, "web_search")
+        if entry is None:
+            # Fallback: direct tool call
+            from services import tools
+            result = tools.call("web_search", {"query": query})
+        else:
+            result = mcp_client.dispatch(entry, {"query": query})
+    except Exception as exc:  # noqa: BLE001
+        await status.edit_text(f"❌ Ошибка поиска: {_html.escape(str(exc)[:300])}")
+        return
+
+    if result.status != "ok":
+        await status.edit_text(
+            f"❌ Поиск не удался: {_html.escape(result.error or 'unknown')}",
+        )
+        return
+
+    hits = (result.output or {}).get("hits") or []
+    if not hits:
+        await status.edit_text("Ничего не найдено.")
+        return
+
+    # FR-36: render results with clickable hyperlinks
+    lines = [f"🌐 <b>Результаты по запросу:</b> <i>{_html.escape(query)}</i>\n"]
+    for i, hit in enumerate(hits[:8], 1):
+        title = _html.escape(hit.get("title") or "(без заголовка)")
+        url = hit.get("url") or ""
+        snippet = _html.escape((hit.get("snippet") or "")[:200])
+        if url:
+            lines.append(f"{i}. <a href=\"{_html.escape(url)}\">{title}</a>")
+        else:
+            lines.append(f"{i}. <b>{title}</b>")
+        if snippet:
+            lines.append(f"   <i>{snippet}</i>")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n<i>…(обрезано)</i>"
+    await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ── FR-9..11: Task mode — goal → plan preview → approval ─────────
@@ -1035,6 +1263,24 @@ def _dedupe_sources(top: list[dict]) -> list[dict]:
     return out
 
 
+def _render_answer_with_hyperlinks(text: str) -> str:
+    """FR-36: wrap every http(s):// URL in the text with an HTML <a>
+    tag so Telegram renders it as a clickable hyperlink. Also strips
+    any stray [N] markers the LLM might produce."""
+    import re
+
+    escaped = _html.escape(text)
+    # Strip stray [N] markers
+    escaped = re.sub(r"\s*\[\d+\]", "", escaped)
+    # Linkify URLs — match http:// and https:// up to whitespace or <
+    escaped = re.sub(
+        r"(https?://[^\s<\"]+)",
+        r'<a href="\1">\1</a>',
+        escaped,
+    )
+    return escaped
+
+
 def _render_answer_with_inline_sources(answer: str, filenames: list[str]) -> str:
     """HTML-escape the answer and bold any filename mentions so the user
     visually spots them. No numbered markers, no footer — the tappable
@@ -1095,35 +1341,263 @@ def _extract_text(data: bytes, filename: str) -> str:
         return ""
 
 
+# ── Live task progress rendering ────────────────────────────────
+
+
+# Max number of progress lines we keep before trimming the oldest.
+# Telegram max message length is 4096 chars; with ~60 chars per line
+# this leaves room for the header and the final summary.
+_MAX_PROGRESS_LINES = 40
+
+
+def _format_progress_event(kind: str, node_id: str | None, payload: dict) -> str | None:
+    """Render a single runtime progress event as a Telegram HTML line.
+
+    Return None for events we don't want to surface (runtime_done is
+    handled separately by the final summary).
+    """
+    if kind == "planner_done":
+        return (
+            f"📋 <b>Планировщик:</b> {payload.get('steps', '?')} шагов, "
+            f"{payload.get('parallel_groups', 0)} параллель, "
+            f"{payload.get('conditional_edges', 0)} условных | "
+            f"backend=<code>{payload.get('backend', '?')}</code>"
+        )
+    if kind == "step_start":
+        tool = payload.get("tool")
+        tool_tag = f" 🔧 <code>{_html.escape(tool)}</code>" if tool else " 💡 reasoning"
+        desc = (payload.get("description") or "")[:90]
+        return f"▸ <b>{_html.escape(node_id or '?')}</b>: {_html.escape(desc)}{tool_tag}"
+    if kind == "tool_call_done":
+        status = payload.get("status")
+        if status == "ok":
+            hits = payload.get("hits")
+            hits_tag = f" ({hits} hits)" if hits is not None else ""
+            provider = payload.get("provider") or "?"
+            return f"   ✅ tool <code>{_html.escape(str(payload.get('tool', '?')))}</code> via <i>{_html.escape(str(provider))}</i>{hits_tag}"
+        err = (payload.get("error") or "")[:80]
+        attempt = payload.get("attempt", 1)
+        return f"   ⚠️ tool error (attempt {attempt}): <i>{_html.escape(err)}</i>"
+    if kind == "tool_retry":
+        attempt = payload.get("attempt", "?")
+        m = payload.get("max", "?")
+        backoff = payload.get("backoff_sec", 0)
+        return f"   🔄 retry {attempt}/{m} (wait {backoff:.1f}s)"
+    if kind == "critic":
+        verdict = payload.get("verdict", "?")
+        icon = "✅" if verdict == "pass" else "❌"
+        reason = (payload.get("reason") or "")[:120]
+        return f"   🧐 critic: {icon} {_html.escape(verdict)} — <i>{_html.escape(reason)}</i>"
+    if kind == "process_critic":
+        action = payload.get("action", "?")
+        icon = "▶️" if action == "continue" else "🛑"
+        reason = (payload.get("reason") or "")[:100]
+        return f"   🧠 process critic: {icon} <b>{_html.escape(action)}</b> — <i>{_html.escape(reason)}</i>"
+    if kind == "alignment":
+        drift = float(payload.get("drift", 0))
+        icon = "⚠️" if payload.get("should_replan") else "·"
+        return f"   🎯 alignment: {icon} drift={drift:.2f}"
+    if kind == "synthesising":
+        prior = payload.get("prior_count", 0)
+        return f"   💡 synthesising from {prior} prior steps…"
+    if kind == "synthesis_done":
+        chars = payload.get("chars", 0)
+        return f"   ✅ synthesis: {chars} chars"
+    if kind == "step_done":
+        return "   ✅ <b>done</b>"
+    if kind == "step_soft_pass":
+        concern = (payload.get("concern") or "")[:100]
+        return f"   🟡 soft-pass (concern: <i>{_html.escape(concern)}</i>)"
+    if kind == "step_abort":
+        reason = (payload.get("reason") or "")[:100]
+        return f"   🛑 <b>abort</b>: <i>{_html.escape(reason)}</i>"
+    return None
+
+
+async def _run_with_live_progress(
+    session_id: str,
+    status_message: Message,
+    advanced: bool,
+) -> "modes_svc.TaskRun | None":
+    """Run `run_advanced` (or legacy `execute`) in a worker thread while
+    editing `status_message` with a live progress log.
+
+    Architecture:
+    - sync progress events go through a `queue.Queue` (thread-safe).
+    - async loop polls the queue, batches events, and edits the
+      status message at most once every 1.5s (Telegram edit rate).
+    - when the worker thread finishes (done or exception), we do a
+      final drain + let the caller render the summary.
+    """
+    progress_q: _queue.Queue = _queue.Queue()
+
+    def _push(kind: str, node_id: str | None, payload: dict) -> None:
+        try:
+            progress_q.put_nowait((kind, node_id, payload))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Kick off the worker thread
+    if advanced:
+        task = asyncio.create_task(
+            asyncio.to_thread(modes_svc.run_advanced, session_id, _push)
+        )
+    else:
+        task = asyncio.create_task(
+            asyncio.to_thread(modes_svc.execute, session_id)
+        )
+
+    header = "🎯 <b>Выполнение плана</b>\n"
+    lines: list[str] = []
+    last_edit = 0.0
+    min_edit_interval = 1.5  # seconds — Telegram rate limit protection
+
+    async def _render() -> None:
+        """Build the current progress text and edit the status message."""
+        visible = lines[-_MAX_PROGRESS_LINES:]
+        body = "\n".join(visible) if visible else "<i>подожди, запускаю…</i>"
+        text = header + "\n" + body
+        # Telegram max ~4096 chars. Leave safety margin.
+        if len(text) > 3800:
+            text = text[:3800] + "\n<i>…(обрезано)</i>"
+        try:
+            await status_message.edit_text(text, parse_mode=ParseMode.HTML)
+        except TelegramBadRequest as e:
+            # "message is not modified" fires when content hasn't
+            # changed — ignore. Any other bad request: log + swallow.
+            if "not modified" not in str(e).lower():
+                logger.debug("status edit: %s", e)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("status edit unexpected: %s", exc)
+
+    # Main drain loop — runs until the worker task finishes
+    while not task.done():
+        # Drain any pending events
+        changed = False
+        while True:
+            try:
+                kind, node_id, payload = progress_q.get_nowait()
+            except _queue.Empty:
+                break
+            line = _format_progress_event(kind, node_id, payload)
+            if line:
+                lines.append(line)
+                changed = True
+
+        now = _time.monotonic()
+        if changed and (now - last_edit) >= min_edit_interval:
+            await _render()
+            last_edit = now
+
+        await asyncio.sleep(0.3)
+
+    # Final drain once the worker is done
+    while True:
+        try:
+            kind, node_id, payload = progress_q.get_nowait()
+        except _queue.Empty:
+            break
+        line = _format_progress_event(kind, node_id, payload)
+        if line:
+            lines.append(line)
+
+    # Show the last progress snapshot once more so nothing is lost
+    if lines:
+        await _render()
+
+    # Await the task — re-raises any exception from the worker
+    try:
+        await task
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("task worker failed")
+        try:
+            await status_message.edit_text(
+                f"{header}\n\n❌ <b>Ошибка:</b> <code>{_html.escape(str(exc)[:500])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    # Return the TaskRun from the session
+    try:
+        session = modes_svc.get_session(session_id)
+        return session.run
+    except Exception:  # noqa: BLE001
+        return None
+
+
 # ── FR-11 / FR-17 / NFR-9: task approval callbacks ──────────────
+
+def _extract_synthesis_text(run) -> str | None:
+    """Find the final synthesis text in the run's results dict.
+
+    Walks the session's advanced_state (FR-20 GraphState) and looks
+    for the last step whose output has a `text` key — that's the
+    convention our LLM-backed synthesis uses in _synthesize_step.
+    Falls back to any result dict that carries `text`, in whatever
+    order they appear, so partial runs still surface something
+    useful.
+    """
+    session = None
+    try:
+        for s in modes_svc._SESSIONS.values():
+            if s.run is run:
+                session = s
+                break
+    except Exception:  # noqa: BLE001
+        return None
+    if session is None or session.advanced_state is None:
+        return None
+    results = session.advanced_state.results or {}
+    # Prefer the LAST step's output if it has text
+    for sid in reversed(list(results.keys())):
+        val = results.get(sid)
+        if isinstance(val, dict) and isinstance(val.get("text"), str):
+            return val["text"]
+    return None
+
 
 def _render_run_summary(run) -> str:
     """Compact human-readable summary of a finished / partial task run.
 
-    Covers NFR-12 artefacts (plan preview + stages walked + trace count
-    + outcome) and, when the LangGraph runtime path was used, surfaces
-    per-step critic verdicts and alignment drift scores from the trace
-    so the user sees WHY each step passed or failed (FR-21, FR-22).
+    Two-section layout:
+    1. **The actual answer** — pulled from the last synthesis step
+       (the one _synthesize_step wrote). This is what the user asked
+       for; it goes first.
+    2. **Diagnostic block** — critic verdicts, goal alignment drifts,
+       trace count, backend, outcome. Collapsed after the answer so
+       the user can inspect or ignore it.
     """
     summary = run.result_summary or {}
     outcome = summary.get("outcome", "—")
     reason = summary.get("reason", "")
     backend = summary.get("backend", "")
 
-    # Legacy stages list (US-3 path).
+    parts: list[str] = []
+
+    # 1. Actual synthesised answer — THIS is what the user wanted.
+    synthesis = _extract_synthesis_text(run)
+    if synthesis:
+        # Telegram HTML max message length is 4096 chars; leave room
+        # for the diagnostic footer.
+        if len(synthesis) > 3500:
+            synthesis = synthesis[:3500] + "\n\n<i>…(обрезано, полный ответ в логах)</i>"
+        parts.append(f"📝 <b>Ответ:</b>\n\n{_html.escape(synthesis)}")
+
+    # 2. Diagnostic footer
     stage_lines = [
         f"  • {s.node_id}: {'✅' if s.status == 'pass' else '❌'}"
         for s in run.stages
     ]
 
-    # Advanced runtime: extract per-step verdicts from the trace.
     critic_lines: list[str] = []
     drift_lines: list[str] = []
     for ev in run.execution_trace:
         if ev.kind == "critic":
             mark = "✅" if ev.payload.get("verdict") == "pass" else "❌"
             critic_lines.append(
-                f"  {mark} {ev.node_id}: {_html.escape(str(ev.payload.get('reason', ''))[:80])}"
+                f"  {mark} {ev.node_id}: {_html.escape(str(ev.payload.get('reason', ''))[:120])}"
             )
         elif ev.kind == "alignment":
             drift = float(ev.payload.get("drift", 0.0))
@@ -1132,41 +1606,49 @@ def _render_run_summary(run) -> str:
                 f"  {warn} {ev.node_id}: drift={drift:.2f}"
             )
 
-    parts: list[str] = []
+    diag: list[str] = []
     if backend:
-        parts.append(f"<b>Runtime:</b> <code>{_html.escape(backend)}</code>")
+        diag.append(f"<b>Runtime:</b> <code>{_html.escape(backend)}</code>")
     if stage_lines:
-        parts.append("<b>Этапы:</b>\n" + "\n".join(stage_lines))
+        diag.append("<b>Этапы:</b>\n" + "\n".join(stage_lines))
     if critic_lines:
-        parts.append("<b>Critic verdicts:</b>\n" + "\n".join(critic_lines[:8]))
+        diag.append("<b>Critic verdicts:</b>\n" + "\n".join(critic_lines[:8]))
     if drift_lines:
-        parts.append("<b>Goal alignment:</b>\n" + "\n".join(drift_lines[:8]))
-    parts.append(f"<b>Trace events:</b> {len(run.execution_trace)}")
-    parts.append(f"<b>Результат:</b> {_html.escape(str(outcome))}")
+        diag.append("<b>Goal alignment:</b>\n" + "\n".join(drift_lines[:8]))
+    diag.append(f"<b>Trace events:</b> {len(run.execution_trace)}")
+    diag.append(f"<b>Результат:</b> {_html.escape(str(outcome))}")
     if reason:
-        parts.append(f"<b>Причина:</b> {_html.escape(str(reason))}")
+        diag.append(f"<b>Причина:</b> {_html.escape(str(reason))}")
+
+    if parts:
+        # Collapse the diagnostics behind a separator under the answer.
+        parts.append("━━━━━━━━━━━━━━\n<i>Диагностика:</i>\n\n" + "\n\n".join(diag))
+    else:
+        # Nothing synthesised — diagnostics IS the message.
+        parts.extend(diag)
     return "\n\n".join(parts)
 
 
 @router.callback_query(F.data.startswith("task_approve:"))
 async def on_task_approve(callback: CallbackQuery):
-    """FR-11 approval gate. Prefers the v1.1 LangGraph runtime
-    (`run_advanced`) when the session has a StructuredPlan; falls back
-    to the legacy `execute()` for sessions that don't.
+    """FR-11 approval gate with **live progress rendering**.
 
-    UX notes:
-    - **ACK immediately** (`callback.answer()` without args) so the
-      Telegram spinner dismisses before the 15-second query timeout.
-      Real runs take 15-30s (LLM planner + SerpAPI + per-step critic
-      + alignment) and without this ACK every tap ends in
-      `TelegramBadRequest: query is too old`.
-    - **Disable the keyboard** right after ACK so the user can't
-      double-tap and spin up a second parallel pipeline (that's twice
-      the OpenAI + SerpAPI bill for the same goal).
-    - **Offload the sync pipeline to a threadpool** via
-      `asyncio.to_thread` so the event loop stays responsive — the
-      /health endpoint, other callbacks, and polling all keep working
-      while the task runs.
+    The pipeline is synchronous (OpenAI + SerpAPI via httpx.Client),
+    so we offload it to a worker thread and poll a `queue.Queue` of
+    progress events. The status message gets edited at most once
+    every 1.5s with the latest progress snapshot (Telegram edit
+    rate limit). When the worker finishes we replace the progress
+    log with the final summary (synthesis + critic verdicts +
+    alignment drifts).
+
+    UX guarantees:
+    - `callback.answer()` fires in the first millisecond so the
+      Telegram spinner dismisses and the 15s query timeout doesn't
+      bite even for 30s+ runs.
+    - `edit_reply_markup(None)` kills the approve keyboard so a
+      second tap can't start a duplicate pipeline.
+    - `asyncio.to_thread` keeps the event loop responsive —
+      `/health` and other callbacks keep working during the run.
     """
     await callback.answer()  # dismiss spinner before 15s timeout
 
@@ -1181,48 +1663,31 @@ async def on_task_approve(callback: CallbackQuery):
         return
 
     # Kill the approval keyboard so a second tap doesn't kick off a
-    # duplicate run. Ignored if Telegram already accepted the first
-    # tap's state mutation.
+    # duplicate run.
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
         pass
 
     status = await callback.message.answer(
-        "⏳ <b>Выполняю план…</b>\n"
-        "<i>Обычно 15–30 секунд: planner → tool calls → per-step critic → goal alignment.</i>",
+        "🎯 <b>Выполнение плана</b>\n\n<i>запускаю…</i>",
         parse_mode=ParseMode.HTML,
     )
 
     try:
         modes_svc.approve_plan(session_id)
-        if session.structured_plan is not None:
-            # Offload the blocking LLM/HTTP pipeline so the event loop
-            # keeps serving /health and other updates.
-            await asyncio.to_thread(modes_svc.run_advanced, session_id)
-            run = session.run
-        else:
-            run = await asyncio.to_thread(modes_svc.execute, session_id)
     except modes_svc.ApprovalRequiredError as e:
         await status.edit_text(
             f"❌ <i>{_html.escape(str(e))}</i>",
             parse_mode=ParseMode.HTML,
         )
         return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("task_approve pipeline failed")
-        await status.edit_text(
-            f"❌ Неожиданная ошибка:\n<code>{_html.escape(str(exc)[:400])}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
+    # Run with live progress — uses queue.Queue + rate-limited edits.
+    advanced = session.structured_plan is not None
+    run = await _run_with_live_progress(session_id, status, advanced=advanced)
     if run is None:
-        await status.edit_text(
-            "❌ Пайплайн не вернул run — проверь логи.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
+        return  # error already rendered inside the helper
 
     # FR-17 / FR-22: material replan or goal drift — re-confirm
     if run.state == "awaiting_approval":
@@ -1246,10 +1711,17 @@ async def on_task_approve(callback: CallbackQuery):
         return
 
     icon = "✅" if run.state == "done" else "❌"
-    await status.edit_text(
-        f"{icon} <b>Задача завершена</b>\n\n{_render_run_summary(run)}",
-        parse_mode=ParseMode.HTML,
-    )
+    final_text = f"{icon} <b>Задача завершена</b>\n\n{_render_run_summary(run)}"
+    # Telegram hard limit 4096; we already trim in _render_run_summary
+    # but the header adds ~30 chars — clip to 4000 just in case.
+    if len(final_text) > 4000:
+        final_text = final_text[:4000] + "\n<i>…(обрезано)</i>"
+    try:
+        await status.edit_text(final_text, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest as e:
+        logger.warning("final edit failed: %s", e)
+        # Fall back to sending as a new message
+        await callback.message.answer(final_text, parse_mode=ParseMode.HTML)
 
 
 @router.callback_query(F.data.startswith("task_reapprove:"))

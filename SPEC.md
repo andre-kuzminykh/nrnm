@@ -233,6 +233,17 @@ Functional Requirements
 | FR-25 | LLM-планировщик получает описания MCP активного домена и использует их как available_tools для привязки шагов                                         |
 | FR-26 | Tool invocation идёт через `services/mcp_client.py`: `builtin://*` → в-процессная реализация, `http(s)://*` → POST на MCP-сервер с bearer token      |
 | FR-27 | RAG-ответ показывает источники как tap-to-original через Telegram `reply_to_message_id`. Никаких `[N]` маркеров, никакого `Источники:` footer          |
+| FR-28 | Убрать кнопки Чат/Задачи. В главном виджете — выбор **инструмента**: Чат, Поиск по файлам, Веб-поиск. Текстовое сообщение при выбранном инструменте уходит именно в него |
+| FR-29 | Каждый инструмент имеет свой набор параметров. Поиск по файлам: мультивыбор доменов. Веб-поиск: нет параметров. Чат: нет параметров |
+| FR-30 | Кнопка «💾 Память» располагается под виджетом текущего инструмента (а не в отдельном меню) |
+| FR-31 | Отдельная большая кнопка **🤖 СУПЕРАГЕНТ** в главном виджете. При нажатии — ввод задачи → LangGraph pipeline → план → approval → execution |
+| FR-32 | После построения плана система отправляет **картинку графа LangGraph** (`compiled.get_graph().draw_mermaid_png()`) как фото в Telegram |
+| FR-33 | После согласования план-сообщение **стирается** и в том же thread'е начинается live progress log с трейсами каждого шага |
+| FR-34 | План отображается в формате `1. → 1.1. → 1.2. ‖ 2.` — с подзадачами и маркерами параллелизма |
+| FR-35 | Среди инструментов доступен **ask_user** — агент может запросить уточнение у пользователя mid-run (inline keyboard «ответить» + FSM ожидания текста) |
+| FR-36 | Все URL в результатах (web search hits, ссылки на файлы) рендерятся как HTML `<a href="...">title</a>` гиперссылки прямо в тексте ответа |
+| FR-37 | Пользователь может **редактировать файл через LLM**: выбрать файл из Памяти, отправить промт-инструкцию, LLM модифицирует содержимое, новая версия сохраняется (Rule 6) |
+| FR-38 | При обновлении файла система **предлагает обновить зависимые файлы** — те, что ранее использовались вместе (same task run / same `[контекст]` набор). Пользователь подтверждает → LLM выполняет тот же набор действий с новым контекстом |
 
 Non-Functional Requirements
 
@@ -243,6 +254,8 @@ Non-Functional Requirements
 | NFR-12 | Каждый task run в режиме Задачи должен содержать `plan_preview`, `execution_trace` и `result_summary` (100%)                                                             |
 | NFR-14 | LLM-компоненты (planner, critic, alignment) должны иметь deterministic stub fallback на случай отсутствия API-ключа / langgraph — для offline dev и CI                   |
 | NFR-15 | Ошибки MCP-клиента (HTTP / network / невалидный response) должны деградировать в `ToolCallResult(status="error")` и триггерить Rule-5 tool_failure replan (FR-16)          |
+| NFR-16 | Все действия пользователя и агента (выбор инструмента, смена домена, tool calls, файловые операции, промты) пишутся в structured action log (JSON per event)               |
+| NFR-17 | Файловое хранение должно быть pluggable: pickle-in-process (v1), S3/Postgres/GDrive/Git/Notion (v2+). Интерфейс: `save(id, content) -> url`, `load(id) -> content`       |
 
 ---
 
@@ -437,6 +450,19 @@ Graph re-evaluation запускается только если:
 | FR-26  | `tests/test_us5_mcp.py`              |
 | FR-27  | `tests/test_us5_mcp.py`              |
 | NFR-15 | `tests/test_us5_mcp.py`              |
+| FR-28  | `tests/test_us6_tool_ui.py`          |
+| FR-29  | `tests/test_us6_tool_ui.py`          |
+| FR-30  | `tests/test_us6_tool_ui.py`          |
+| FR-31  | `tests/test_us6_tool_ui.py`          |
+| FR-32  | `tests/test_us6_tool_ui.py`          |
+| FR-33  | `tests/test_us6_tool_ui.py`          |
+| FR-34  | `tests/test_us6_tool_ui.py`          |
+| FR-35  | `tests/test_us6_tool_ui.py`          |
+| FR-36  | `tests/test_us6_tool_ui.py`          |
+| FR-37  | `tests/test_us7_file_edit.py`        |
+| FR-38  | `tests/test_us7_file_edit.py`        |
+| NFR-16 | `tests/test_us6_tool_ui.py`          |
+| NFR-17 | `tests/test_us7_file_edit.py`        |
 
 > На момент фиксации v1-спеки многие поведения ещё не реализованы в коде (`services/platform.py` описывает legacy domain-based API из FR-P1..P19). Тесты под ещё не реализованные требования помечены `pytest.skip(...)` с явным `TODO` — они образуют spec-driven roadmap и активируются по мере реализации соответствующих модулей.
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import operator
+import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Callable, TypedDict
 
@@ -118,17 +119,35 @@ def runtime_backend() -> str:
 # ── Compile + run ────────────────────────────────────────────────
 
 
+#: Max number of tool-call attempts per step before we give up and
+#: return status=error to the runner (which then hands off to
+#: process_critic).
+MAX_TOOL_RETRIES = 3
+
+
+# A progress callback is `(kind, node_id, payload) -> None`. It's
+# invoked from inside the worker thread and MUST be fast + thread-safe.
+# The bot handler uses a Queue.put() here so the async loop can
+# consume events and edit the Telegram status message.
+ProgressCallback = Callable[[str, "str | None", dict], None]
+
+
 @dataclass
 class CompiledPlan:
     """Opaque handle returned by `compile_plan` and consumed by `run`.
     Carries the original plan, the backend runner closure, and the
     (tg_id, active_domain) context that step runners capture via
-    closure for MCP dispatch (FR-26)."""
+    closure for MCP dispatch (FR-26).
+
+    `progress_callback` is captured here so the same compiled plan
+    can be invoked with the same listener across retries / re-runs.
+    """
     plan: StructuredPlan
     backend: str
     runner: Callable[[GraphState], GraphState]
     tg_id: int | None = None
     active_domain: str | None = None
+    progress_callback: ProgressCallback | None = None
 
 
 def compile_plan(
@@ -136,6 +155,7 @@ def compile_plan(
     *,
     tg_id: int | None = None,
     active_domain: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> CompiledPlan:
     """FR-20: turn the StructuredPlan into something `run()` can drive.
 
@@ -145,13 +165,24 @@ def compile_plan(
     the legacy hardcoded `tool_layer.call` path.
     """
     if _langgraph_available():
-        compiled = _compile_langgraph(plan, tg_id, active_domain)
+        compiled = _compile_langgraph(plan, tg_id, active_domain, progress_callback)
     else:
-        compiled = _compile_linear(plan, tg_id, active_domain)
+        compiled = _compile_linear(plan, tg_id, active_domain, progress_callback)
     logger.info(
         "runtime: compiled plan %s (%d steps) -> backend=%s | domain=%s",
         plan.plan_id, len(plan.steps), compiled.backend, active_domain or "-",
     )
+    if progress_callback:
+        try:
+            progress_callback("planner_done", None, {
+                "plan_id": plan.plan_id,
+                "steps": len(plan.steps),
+                "parallel_groups": len(plan.parallel_groups),
+                "conditional_edges": len(plan.conditional_edges),
+                "backend": compiled.backend,
+            })
+        except Exception:  # noqa: BLE001
+            pass
     return compiled
 
 
@@ -185,6 +216,16 @@ def run(
         len(final.completed_step_ids), len(compiled.plan.steps),
         final.replan_signal, len(final.trace),
     )
+    if compiled.progress_callback:
+        try:
+            compiled.progress_callback("runtime_done", None, {
+                "completed": len(final.completed_step_ids),
+                "total": len(compiled.plan.steps),
+                "replan_signal": final.replan_signal,
+                "trace_events": len(final.trace),
+            })
+        except Exception:  # noqa: BLE001
+            pass
     return final
 
 
@@ -196,16 +237,33 @@ def _make_step_runner(
     plan: StructuredPlan,
     tg_id: int | None = None,
     active_domain: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> Callable[[GraphState], GraphState]:
-    """Closure that executes one step + critic + alignment, mutates
-    state in-place, and respects the replan_signal short-circuit.
+    """Closure that executes one step + critic + alignment + retries.
 
-    `tg_id` / `active_domain` baked in here flow to `_execute_step`
-    via the GraphState object — if the caller didn't already set
-    them on state, we seed from the closure capture. This lets the
-    LangGraph backend avoid threading domain context through the
-    state schema (which would force us into reducer gymnastics).
+    Lifecycle:
+      1. Emit `step_start`.
+      2. Run `_execute_step_with_retries` — up to MAX_TOOL_RETRIES
+         attempts on tool_failure with exponential backoff.
+      3. Run `llm_judge.critic`. On fail, hand off to
+         `llm_judge.process_critic` which decides
+         `continue` (soft pass + concern) or `abort` (replan).
+      4. Run `llm_judge.goal_alignment`. On high drift, set
+         replan_signal=goal_drift and stop.
+      5. Emit `step_done` / `step_soft_pass` / `step_abort`.
+
+    `tg_id` / `active_domain` / `progress_callback` are captured via
+    closure so the LangGraph backend never needs to thread them
+    through its state schema.
     """
+
+    def _progress(kind: str, payload: dict | None = None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(kind, step.id, payload or {})
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("progress callback raised: %s", exc)
 
     def _runner(state: GraphState) -> GraphState:
         if state.tg_id is None:
@@ -213,8 +271,7 @@ def _make_step_runner(
         if state.active_domain is None:
             state.active_domain = active_domain
         # LangGraph defaults missing Annotated[str, ...] channels to ""
-        # rather than None. Treat empty string as "no signal" so the
-        # short-circuit only fires on a real veto.
+        # rather than None. Treat empty string as "no signal".
         if state.replan_signal:
             return state  # short-circuit: prior step already vetoed
 
@@ -222,9 +279,13 @@ def _make_step_runner(
             "runtime: [%s] start | tool=%s | desc=%r",
             step.id, step.tool or "reasoning", step.description[:80],
         )
+        _progress("step_start", {
+            "description": step.description,
+            "tool": step.tool,
+        })
 
-        # 1. Execute the step
-        result = _execute_step(step, state)
+        # 1. Execute the step (with tool retries inside)
+        result = _execute_step_with_retries(step, state, _progress)
         state.results[step.id] = result
         state.trace.append(TraceEvent(
             kind="step",
@@ -232,7 +293,7 @@ def _make_step_runner(
             payload={"description": step.description, "tool": step.tool},
         ))
 
-        # 2. Critic verdict
+        # 2. Step-level critic
         verdict = llm_judge.critic(
             step_description=step.description,
             expected_result=step.expected_result,
@@ -250,11 +311,69 @@ def _make_step_runner(
         ))
         logger.info(
             "runtime: [%s] critic(%s)=%s | reason=%r",
-            step.id, verdict.provider, verdict.verdict, verdict.reason[:80],
+            step.id, verdict.provider, verdict.verdict, verdict.reason[:200],
         )
+        _progress("critic", {
+            "verdict": verdict.verdict,
+            "reason": verdict.reason,
+            "provider": verdict.provider,
+        })
+
         if verdict.verdict == "fail":
-            logger.warning("runtime: [%s] CRITIC VETO -> replan_signal=critic_failed", step.id)
-            state.replan_signal = "critic_failed"
+            logger.warning(
+                "runtime: [%s] STEP CRITIC fail | full_reason=%r",
+                step.id, verdict.reason,
+            )
+            # 2a. Process-level critic decides continue vs abort
+            process_verdict = llm_judge.process_critic(
+                goal=state.goal,
+                step_description=step.description,
+                step_result=result,
+                critic_reason=verdict.reason,
+                prior_results=state.results,
+            )
+            state.trace.append(TraceEvent(
+                kind="process_critic",
+                node_id=step.id,
+                payload={
+                    "action": process_verdict.action,
+                    "reason": process_verdict.reason,
+                    "concern": process_verdict.concern,
+                    "provider": process_verdict.provider,
+                },
+            ))
+            logger.info(
+                "runtime: [%s] process_critic(%s)=%s | reason=%r",
+                step.id, process_verdict.provider,
+                process_verdict.action, process_verdict.reason[:200],
+            )
+            _progress("process_critic", {
+                "action": process_verdict.action,
+                "reason": process_verdict.reason,
+                "concern": process_verdict.concern,
+                "provider": process_verdict.provider,
+            })
+
+            if process_verdict.action == "abort":
+                logger.warning(
+                    "runtime: [%s] PROCESS CRITIC ABORT -> replan_signal=critic_failed",
+                    step.id,
+                )
+                state.replan_signal = "critic_failed"
+                _progress("step_abort", {
+                    "reason": process_verdict.reason,
+                })
+                return state
+
+            # action == "continue": soft-pass, stash concern onto
+            # the result so synthesis sees it
+            if isinstance(state.results.get(step.id), dict):
+                state.results[step.id]["_concern"] = process_verdict.concern
+            state.completed_step_ids.append(step.id)
+            _progress("step_soft_pass", {
+                "concern": process_verdict.concern,
+            })
+            logger.info("runtime: [%s] soft-pass (concern noted)", step.id)
             return state
 
         # 3. Goal alignment
@@ -277,36 +396,44 @@ def _make_step_runner(
             "runtime: [%s] alignment(%s)=%.2f replan=%s",
             step.id, align.provider, align.drift, align.should_replan,
         )
+        _progress("alignment", {
+            "drift": align.drift,
+            "should_replan": align.should_replan,
+            "reason": align.reason,
+            "provider": align.provider,
+        })
+
         if align.should_replan:
             logger.warning(
                 "runtime: [%s] DRIFT %.2f>threshold -> replan_signal=goal_drift",
                 step.id, align.drift,
             )
             state.replan_signal = "goal_drift"
+            _progress("step_abort", {
+                "reason": f"goal_drift drift={align.drift:.2f}",
+            })
             return state
 
         # 4. Step completed cleanly
         state.completed_step_ids.append(step.id)
         logger.info("runtime: [%s] done", step.id)
+        _progress("step_done", {})
         return state
 
     return _runner
 
 
-def _execute_step(step: PlanStep, state: GraphState) -> Any:
-    """Run the actual work of a step.
+def _execute_step_with_retries(
+    step: PlanStep,
+    state: GraphState,
+    progress: Callable[[str, dict | None], None],
+) -> Any:
+    """Run a step with automatic retry on tool_failure.
 
-    - If the step binds a tool and the GraphState carries a
-      (tg_id, active_domain) pair, route through the MCP registry:
-      look up the entry by name and dispatch via `services.mcp_client`.
-      This is the FR-26 path — tool calls are per-domain, transport
-      is decided by the MCP URL scheme.
-    - If no domain context, fall back to the legacy
-      `services.tools.call()` path so existing US-3 tests (which
-      don't set up a domain) keep working.
-    - If no tool at all, treat the step as a synthesis / reasoning
-      marker — record the description as the result. The critic
-      judges it on its own merits.
+    Retries only apply to TOOL calls (where transient network /
+    provider issues are common). Synthesis steps don't retry —
+    they're deterministic from their inputs. Exponential backoff:
+    0.3s, 0.6s, 1.2s between attempts.
     """
     if step.tool:
         # Resolve any state references in tool_args (e.g. {"query": "$goal"})
@@ -314,31 +441,163 @@ def _execute_step(step: PlanStep, state: GraphState) -> Any:
             k: state.goal if v == "$goal" else v
             for k, v in (step.tool_args or {}).items()
         }
-        # Inject a default `query` for search-y tools when missing
         if "query" not in args and ("search" in step.tool.lower()):
             args["query"] = state.goal
 
-        result = _dispatch_tool(step.tool, args, state)
+        last_error = "no attempts"
+        for attempt in range(1, MAX_TOOL_RETRIES + 1):
+            if attempt > 1:
+                backoff = 0.3 * (2 ** (attempt - 2))
+                progress("tool_retry", {
+                    "attempt": attempt,
+                    "max": MAX_TOOL_RETRIES,
+                    "prev_error": last_error,
+                    "backoff_sec": backoff,
+                })
+                logger.info(
+                    "runtime: [%s] tool_retry %d/%d after %.1fs | prev=%r",
+                    step.id, attempt, MAX_TOOL_RETRIES, backoff, last_error,
+                )
+                time.sleep(backoff)
 
-        provider = (result.metadata or {}).get("provider")
-        mcp_url = (result.metadata or {}).get("mcp_url")
-        state.trace.append(TraceEvent(
-            kind="tool_call",
-            node_id=step.id,
-            payload={
+            result = _dispatch_tool(step.tool, args, state)
+
+            hits = None
+            if isinstance(result.output, dict) and "hits" in result.output:
+                hits = len(result.output["hits"])
+            state.trace.append(TraceEvent(
+                kind="tool_call",
+                node_id=step.id,
+                payload={
+                    "tool": step.tool,
+                    "status": result.status,
+                    "provider": (result.metadata or {}).get("provider"),
+                    "mcp_url": (result.metadata or {}).get("mcp_url"),
+                    "attempt": attempt,
+                },
+            ))
+
+            if result.status == "ok":
+                progress("tool_call_done", {
+                    "tool": step.tool,
+                    "status": "ok",
+                    "hits": hits,
+                    "provider": (result.metadata or {}).get("provider"),
+                    "attempt": attempt,
+                })
+                return result.output
+
+            last_error = result.error or "unknown error"
+            progress("tool_call_done", {
                 "tool": step.tool,
-                "status": result.status,
-                "provider": provider,
-                "mcp_url": mcp_url,
-            },
-        ))
-        if result.status != "ok":
-            return {"error": result.error or "tool failed", "tool": step.tool}
-        return result.output
+                "status": "error",
+                "error": last_error,
+                "attempt": attempt,
+            })
 
-    # Pure reasoning step — no tool. Use the description as a placeholder
-    # synthesis. A real LLM call would go here.
-    return {"synthesis": step.description, "based_on": list(state.results.keys())}
+        # All retries exhausted
+        logger.warning(
+            "runtime: [%s] tool %s exhausted %d retries, last_error=%r",
+            step.id, step.tool, MAX_TOOL_RETRIES, last_error,
+        )
+        return {"error": last_error, "tool": step.tool, "attempts": MAX_TOOL_RETRIES}
+
+    # Synthesis step — call the LLM with prior step results
+    progress("synthesising", {
+        "prior_count": len(state.results),
+        "prior_ids": list(state.results.keys()),
+    })
+    synth = _synthesize_step(step, state)
+    if isinstance(synth, dict) and "text" in synth:
+        progress("synthesis_done", {
+            "chars": len(synth.get("text") or ""),
+        })
+    return synth
+
+
+# Note: the legacy `_execute_step` was folded into
+# `_execute_step_with_retries` above. Kept here only as a reference
+# point — the real dispatch lives in the retry wrapper now.
+
+
+def _synthesize_step(step: PlanStep, state: GraphState) -> Any:
+    """LLM-backed synthesis for tool-less steps.
+
+    Takes the step description + every prior step's result + the
+    original goal, asks GPT-4o-mini to produce a concise answer, and
+    returns `{"text": <llm output>, "based_on": [step ids]}`.
+
+    When LLM_API_KEY is empty, returns a deterministic stub carrying
+    the same shape so the runtime contract stays stable for tests.
+    """
+    import config
+
+    prior_ids = list(state.results.keys())
+
+    if not config.LLM_API_KEY:
+        return {
+            "text": f"(stub synthesis) {step.description}",
+            "based_on": prior_ids,
+        }
+
+    # Pack prior step outputs into a compact JSON-ish string so the
+    # model sees everything that happened before without hitting token
+    # limits. Each entry is trimmed to ~1500 chars.
+    import json as _json
+
+    def _pack(value: Any) -> str:
+        try:
+            s = _json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:  # noqa: BLE001
+            s = str(value)
+        return s if len(s) <= 1500 else s[:1500] + "…"
+
+    prior_block = "\n\n".join(
+        f"[{sid}]\n{_pack(state.results.get(sid))}"
+        for sid in prior_ids
+    )
+
+    system_msg = (
+        "You are the final-step synthesiser in a multi-step agent. "
+        "Combine the prior step outputs into a clean, useful answer "
+        "for the user's goal. Write in the same language as the goal. "
+        "Use markdown headers/bullets if helpful. Keep it concrete: "
+        "cite filenames or source titles inline when they appear in "
+        "the prior outputs. Do NOT add [1], [2] citation numbers. "
+        "If prior outputs are thin, say so honestly and summarise "
+        "what you do have."
+    )
+    user_msg = (
+        f"Goal: {state.goal}\n\n"
+        f"Step description: {step.description}\n"
+        f"Expected result: {step.expected_result}\n\n"
+        f"Prior step outputs:\n{prior_block if prior_block else '(none)'}"
+    )
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip() or "(пусто)"
+        logger.info(
+            "runtime: [%s] synthesised %d chars from %d prior steps",
+            step.id, len(text), len(prior_ids),
+        )
+        return {"text": text, "based_on": prior_ids}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("synthesis LLM failed for %s: %s", step.id, exc)
+        return {
+            "text": f"(synthesis failed: {exc})\n\nfallback: {step.description}",
+            "based_on": prior_ids,
+        }
 
 
 def _dispatch_tool(tool_name: str, args: dict, state: GraphState):
@@ -403,6 +662,7 @@ def _compile_langgraph(
     plan: StructuredPlan,
     tg_id: int | None = None,
     active_domain: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> CompiledPlan:
     """Build a real `langgraph.StateGraph` from the StructuredPlan.
 
@@ -417,7 +677,7 @@ def _compile_langgraph(
     # Wrap each PlanStep runner so it can convert between LG dict and
     # our dataclass GraphState.
     for step in plan.steps:
-        runner = _make_step_runner(step, plan, tg_id, active_domain)
+        runner = _make_step_runner(step, plan, tg_id, active_domain, progress_callback)
         sg.add_node(step.id, _wrap_for_langgraph(runner))
 
     # Sequential edges from depends_on
@@ -480,6 +740,7 @@ def _compile_langgraph(
     return CompiledPlan(
         plan=plan, backend="langgraph", runner=_runner,
         tg_id=tg_id, active_domain=active_domain,
+        progress_callback=progress_callback,
     )
 
 
@@ -558,23 +819,25 @@ def _compile_linear(
     plan: StructuredPlan,
     tg_id: int | None = None,
     active_domain: str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> CompiledPlan:
     """Topologically sort the plan and walk it sequentially."""
     order = _topological_sort(plan)
 
     def _runner(state: GraphState) -> GraphState:
         for sid in order:
-            if state.replan_signal is not None:
+            if state.replan_signal:
                 break
             step = next((s for s in plan.steps if s.id == sid), None)
             if step is None:
                 continue
-            _make_step_runner(step, plan, tg_id, active_domain)(state)
+            _make_step_runner(step, plan, tg_id, active_domain, progress_callback)(state)
         return state
 
     return CompiledPlan(
         plan=plan, backend="linear", runner=_runner,
         tg_id=tg_id, active_domain=active_domain,
+        progress_callback=progress_callback,
     )
 
 
