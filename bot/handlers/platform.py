@@ -1940,17 +1940,28 @@ def _extract_synthesis_text(run) -> str | None:
 
 
 def _md_to_html(text: str) -> str:
-    """Convert basic markdown to Telegram HTML.
+    """Convert LLM markdown output to Telegram HTML.
 
-    Handles: # headings → <b>, **bold** → <b>, URLs → <a href>,
-    strips [N] markers, unwraps (https://...) parentheses,
-    preserves line breaks.
+    Handles:
+    - # headings → <b>
+    - **bold** → <b>
+    - [N] inline citations → <b>[N]</b> (kept, not stripped)
+    - Source lines `[N] Title — https://url` → `[N] <a href="url">Title</a>`
+    - Bare URLs → <a href>
+    - [text](url) markdown links → <a href>
+    - (https://...) unwrapped
     """
     import re
 
-    # Pre-process: unwrap markdown links [text](url) → text url
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+?)\)", r"\1 \2 ", text)
-    # Pre-process: unwrap bare parenthesized URLs (https://...) → https://...
+    # Pre-process: unwrap markdown links [text](url) → <a href>
+    # BUT only if text is NOT a number (those are citation markers)
+    def _md_link(m):
+        txt, url = m.group(1), m.group(2)
+        if txt.isdigit():
+            return m.group(0)  # keep [1](url) as-is — it's a citation
+        return f'{txt} <a href="{url}">{url}</a>'
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+?)\)", _md_link, text)
+    # Unwrap bare parenthesized URLs
     text = re.sub(r"\((https?://[^)]+?)\)", r" \1 ", text)
 
     lines = text.split("\n")
@@ -1961,12 +1972,23 @@ def _md_to_html(text: str) -> str:
         if m:
             out.append(f"<b>{_html.escape(m.group(1))}</b>")
             continue
+
+        # Source line: [N] Title — https://url → [N] <a href>Title</a>
+        m = re.match(r"^\s*\[(\d+)\]\s+(.+?)\s*[—–-]\s*(https?://\S+)\s*$", line)
+        if m:
+            num, title, url = m.group(1), m.group(2), m.group(3)
+            out.append(
+                f'<b>[{num}]</b> <a href="{_html.escape(url)}">'
+                f'{_html.escape(title)}</a>'
+            )
+            continue
+
         esc = _html.escape(line)
         # **bold** → <b>bold</b>
         esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
-        # Strip [N] markers
-        esc = re.sub(r"\s*\[\d+\]", "", esc)
-        # URLs → <a href> (after escaping, & becomes &amp; — need to handle)
+        # [N] inline citation → bold
+        esc = re.sub(r"\[(\d+)\]", r"<b>[\1]</b>", esc)
+        # Bare URLs → <a href>
         esc = re.sub(
             r"(https?://[^\s<&]+(?:&amp;[^\s<&]+)*)",
             r'<a href="\1">\1</a>',

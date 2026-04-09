@@ -88,9 +88,12 @@ def test_fr_44_superagent_refinement_includes_original_goal():
     _PLAN_HISTORY.pop(tg_id, None)
 
 
-def test_fr_44_md_to_html_converts_urls_and_strips_parens():
-    """URLs in synthesis should become <a href> hyperlinks.
-    Parenthesized URLs (https://...) and [text](url) should be unwrapped."""
+def test_fr_44_md_to_html_handles_citations_and_sources():
+    """_md_to_html should:
+    - Bold [N] inline citations
+    - Convert source lines [N] Title — URL into hyperlinks
+    - Handle headings, bold, bare URLs
+    """
     try:
         from bot.handlers.platform import _md_to_html
     except ImportError:
@@ -98,23 +101,24 @@ def test_fr_44_md_to_html_converts_urls_and_strips_parens():
 
     result = _md_to_html(
         "# Отчёт\n\n"
-        "Рынок растёт по данным https://ifr.org/report на 15%.\n"
+        "Рынок вырос на 15% [1]. Лидеры: ABB, KUKA [2].\n"
         "Подробнее (https://example.com/details) здесь.\n"
-        "Также [см. отчёт](https://report.eu/2024).\n"
-        "Источник [1] не нужен."
+        "Также [см. отчёт](https://report.eu/2024).\n\n"
+        "[1] IFR Annual Report — https://ifr.org/report\n"
+        "[2] EU Robotics Review — https://robotics.eu/review"
     )
     # Headings
     assert "<b>Отчёт</b>" in result
-    # Inline URL as <a href>
-    assert '<a href="https://ifr.org/report">' in result
+    # Inline [1] → bold
+    assert "<b>[1]</b>" in result
+    assert "<b>[2]</b>" in result
+    # Source lines: [N] Title as hyperlink
+    assert '<a href="https://ifr.org/report">IFR Annual Report</a>' in result
+    assert '<a href="https://robotics.eu/review">EU Robotics Review</a>' in result
     # Parenthesized URL unwrapped
     assert "(https://example.com/details)" not in result
-    assert '<a href="https://example.com/details">' in result
-    # Markdown link [text](url) unwrapped
+    # Markdown link unwrapped
     assert "](https://" not in result
-    assert '<a href="https://report.eu/2024">' in result
-    # [1] stripped
-    assert "[1]" not in result
 
 
 def test_fr_44_web_search_query_uses_history(monkeypatch):
