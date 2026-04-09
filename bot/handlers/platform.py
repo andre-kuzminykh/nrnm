@@ -639,17 +639,24 @@ async def on_ftree_mkdir(callback: CallbackQuery):
     tg_id = callback.from_user.id
     parent_path = callback.data.split(":", 1)[1]
     _set_wait(tg_id, "ftree_mkdir")
-    _USER_TREE_PATH[tg_id] = parent_path  # remember where to create
-    await _replace_widget(
-        callback.message,
-        f"📁 <b>Новая папка в {_breadcrumb(parent_path)}</b>\n\n"
-        "Отправьте название папки.",
+    _USER_TREE_PATH[tg_id] = parent_path
+    try:
+        await callback.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    sent = await callback.message.bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=(
+            f"📁 <b>Новая папка в {_breadcrumb(parent_path)}</b>\n\n"
+            "Отправьте название одним сообщением."
+        ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"ftree:{parent_path}")],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer()
+    _track_msg(tg_id, sent.message_id)
+    await callback.answer("Введите название")
 
 
 @router.callback_query(F.data.startswith("ftree_delete:"))
@@ -1125,15 +1132,20 @@ async def platform_handle_message(message: Message) -> bool:
         name = message.text.strip()
         parent_path = _get_tree_path(tg_id)
         try:
-            file_tree_svc.create_folder(tg_id, parent_path, name)
+            node = file_tree_svc.create_folder(tg_id, parent_path, name)
         except ValueError as e:
             await message.answer(f"❌ {e}")
             return True
         _set_wait(tg_id, "platform")
-        await message.answer(
-            f"✅ Папка <b>{_html.escape(name)}</b> создана в {_breadcrumb(parent_path)}",
+        _set_tree_path(tg_id, parent_path)
+        # Show confirmation + re-render the parent folder
+        sent = await message.answer(
+            f"✅ Папка <b>{_html.escape(name)}</b> создана",
             parse_mode=ParseMode.HTML,
         )
+        _track_msg(tg_id, sent.message_id)
+        # Re-show the parent folder so user sees the new subfolder
+        await _show_folder(sent, tg_id, parent_path, page=0)
         return True
 
     # 0c. СУПЕРАГЕНТ goal input — next text becomes the task goal
