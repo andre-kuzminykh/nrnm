@@ -974,29 +974,11 @@ async def on_platform_reset(callback: CallbackQuery):
 async def on_platform_save_answer(callback: CallbackQuery):
     tg_id = callback.from_user.id
     user = platform_svc.get_user(tg_id)
-    active = platform_svc.get_active_domains(tg_id)
-    if not active:
-        await callback.answer("Нет активного домена — выберите в 💾 Память", show_alert=True)
-        return
     if not user.last_answer:
-        await callback.answer("Нет ответа для сохранения", show_alert=True)
+        await callback.answer()
         return
-    if not rag.is_configured():
-        await callback.answer("RAG не настроен", show_alert=True)
-        return
-    domain_name = active[0]
-    doc_id = uuid.uuid4().hex[:12]
-    n = await rag.ingest_document(
-        platform_svc.collection_name(tg_id, domain_name),
-        doc_id, f"saved-{doc_id}.txt", user.last_answer,
-    )
-    if n == 0:
-        await callback.answer("Не удалось сохранить", show_alert=True)
-        return
-    platform_svc.register_document(tg_id, domain_name, f"saved-{doc_id}.txt", n)
-    await callback.answer(f"Сохранено в «{domain_name}» ({n} фр.)", show_alert=True)
-    # FR-P19: swap the inline button to its «✅» state. Also untrack
-    # the message so it survives the 🔄 reset wipe — saved = permanent.
+
+    # Instant: flip to ✅ + untrack so message survives reset
     _untrack_msg(tg_id, callback.message.message_id)
     try:
         await callback.message.edit_reply_markup(
@@ -1004,12 +986,33 @@ async def on_platform_save_answer(callback: CallbackQuery):
         )
     except TelegramBadRequest:
         pass
+    await callback.answer()
+
+    # Background: ingest into RAG (non-blocking for the user)
+    active = platform_svc.get_active_domains(tg_id)
+    if active and rag.is_configured():
+        domain_name = active[0]
+        doc_id = uuid.uuid4().hex[:12]
+        try:
+            n = await rag.ingest_document(
+                platform_svc.collection_name(tg_id, domain_name),
+                doc_id, f"saved-{doc_id}.txt", user.last_answer,
+            )
+            if n > 0:
+                platform_svc.register_document(tg_id, domain_name, f"saved-{doc_id}.txt", n)
+                # Also add to file tree
+                tree_path = _get_tree_path(tg_id)
+                try:
+                    file_tree_svc.add_file(tg_id, tree_path, f"saved-{doc_id}.txt", doc_id, n)
+                except ValueError:
+                    file_tree_svc.add_file(tg_id, "/", f"saved-{doc_id}.txt", doc_id, n)
+        except Exception:  # noqa: BLE001
+            logger.debug("background save-to-RAG failed", exc_info=True)
 
 
 @router.callback_query(F.data == "platform_save_noop")
 async def on_platform_save_noop(callback: CallbackQuery):
-    """FR-P19: idle callback for the «✅ Сохранено» state — already saved."""
-    await callback.answer("Уже сохранено")
+    await callback.answer()
 
 
 # ── Document upload (no button — just send a file while on platform) ──
