@@ -2179,9 +2179,15 @@ async def on_task_approve(callback: CallbackQuery):
     if synthesis:
         tg_id = callback.from_user.id
         platform_svc.add_chat_message(tg_id, "assistant", synthesis[:2000])
+
+    if not final_text or not final_text.strip():
+        final_text = "<i>Задача выполнена, но результат пуст.</i>"
     if len(final_text) > 4000:
         final_text = final_text[:4000]
     final_text = _safe_html(final_text)
+
+    # Try to edit the progress message → if fails, send as NEW message
+    delivered = False
     try:
         await status.edit_text(
             final_text,
@@ -2189,26 +2195,34 @@ async def on_task_approve(callback: CallbackQuery):
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except TelegramBadRequest:
-        # Last resort: strip → re-linkify → try again
-        import re
-        plain = re.sub(r"<[^>]+>", "", final_text)
-        # Re-add hyperlinks on bare URLs so they're still clickable
-        linked = re.sub(
-            r"(https?://[^\s]+?)([.,;:!?)\s]|$)",
-            r'<a href="\1">\1</a>\2',
-            _html.escape(plain),
-        )
+        delivered = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("final edit failed: %s", e)
+
+    if not delivered:
         try:
-            await status.edit_text(
+            import re as _re
+            plain = _re.sub(r"<[^>]+>", "", final_text)
+            linked = _re.sub(
+                r"(https?://[^\s]+?)([.,;:!?)\s]|$)",
+                r'<a href="\1">\1</a>\2',
+                _html.escape(plain),
+            )
+            await callback.message.answer(
                 linked[:4000],
                 reply_markup=platform_answer_keyboard(),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
         except Exception:  # noqa: BLE001
-            # Absolute last resort — no HTML at all
-            await callback.message.answer(plain[:4000])
+            # Absolute last resort — no HTML
+            try:
+                import re as _re
+                await callback.message.answer(
+                    _re.sub(r"<[^>]+>", "", final_text)[:4000],
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("could not deliver final result at all")
 
 
 @router.callback_query(F.data.startswith("task_reapprove:"))
