@@ -477,6 +477,17 @@ def _execute_step_with_retries(
                 },
             ))
 
+            if result.status == "pending":
+                # FR-47: ask_user — pause execution
+                progress("tool_call_done", {
+                    "tool": step.tool,
+                    "status": "pending",
+                    "question": (result.output or {}).get("question", ""),
+                    "attempt": attempt,
+                })
+                # Store the question so the bot can show it
+                return {"pending": True, "question": (result.output or {}).get("question", "")}
+
             if result.status == "ok":
                 progress("tool_call_done", {
                     "tool": step.tool,

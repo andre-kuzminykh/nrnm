@@ -211,14 +211,30 @@ def _default_mcp_bootstrap() -> list[MCPEntry]:
         MCPEntry(
             name="web_search",
             url="builtin://serpapi",
-            token="",  # inherits config.SERPAPI_API_KEY
-            description=(
-                "Веб-поиск актуальной информации через SerpAPI (Google). "
-                "Используется для любых задач поиска: новости, факты, "
-                "research, 'найди X', проверка свежих данных."
-            ),
-            created_at=now,
-            updated_at=now,
+            token="",
+            description="Поиск в интернете: новости, факты, цены, актуальные данные.",
+            created_at=now, updated_at=now,
+        ),
+        MCPEntry(
+            name="rag_search",
+            url="builtin://rag_search",
+            token="",
+            description="Поиск по внутренней базе знаний (загруженные файлы пользователя).",
+            created_at=now, updated_at=now,
+        ),
+        MCPEntry(
+            name="file_open",
+            url="builtin://file_open",
+            token="",
+            description="Открыть конкретный файл целиком. Автосуммаризация если слишком большой.",
+            created_at=now, updated_at=now,
+        ),
+        MCPEntry(
+            name="ask_user",
+            url="builtin://ask_user",
+            token="",
+            description="Спросить пользователя. Используй когда не хватает информации.",
+            created_at=now, updated_at=now,
         ),
     ]
 

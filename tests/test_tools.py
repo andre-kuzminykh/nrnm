@@ -29,8 +29,14 @@ def test_fr_13_disallowed_tool_raises():
         tool_layer.call("rm_rf")
 
 
-def test_fr_13_exactly_two_tools_in_v1():
-    assert tool_layer.list_tools() == {"web_search", "pdf_parser"}
+def test_fr_13_core_tools_registered():
+    tools = tool_layer.list_tools()
+    assert "web_search" in tools
+    assert "pdf_parser" in tools
+    # v2 additions
+    assert "ask_user" in tools
+    assert "rag_search" in tools
+    assert "file_open" in tools
 
 
 # ── Provider routing ────────────────────────────────────────────
