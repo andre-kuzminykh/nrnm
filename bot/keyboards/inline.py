@@ -119,10 +119,10 @@ def platform_answer_keyboard(saved: bool = False) -> InlineKeyboardMarkup:
        affects, not on the static main menu.
     """
     if saved:
-        save_btn = InlineKeyboardButton(text="✅ Сохранено", callback_data="platform_save_noop")
+        save_btn = InlineKeyboardButton(text="✅", callback_data="platform_save_noop")
     else:
-        save_btn = InlineKeyboardButton(text="💾 Сохранить в память", callback_data="platform_save_answer")
-    reset_btn = InlineKeyboardButton(text="🔄 Обновить контекст", callback_data="platform_reset")
+        save_btn = InlineKeyboardButton(text="💾", callback_data="platform_save_answer")
+    reset_btn = InlineKeyboardButton(text="🔄", callback_data="platform_reset")
     return InlineKeyboardMarkup(inline_keyboard=[
         [save_btn, reset_btn],
     ])
