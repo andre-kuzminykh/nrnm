@@ -47,11 +47,12 @@ def platform_menu_keyboard(
         dom_label = ", ".join(active_domains)
     dom_button_text = f"📁 Домен: {dom_label}" if n_doms <= 1 else f"📁 Домены: {dom_label}"
 
-    # Instrument picker row: Чат | Память | Веб
+    # Instrument picker: Чат | Память | Веб | 🧠 Агент
     instruments = [
         ("chat", "💬", "Чат"),
         ("file_search", "📁", "Память"),
         ("web_search", "🌐", "Веб"),
+        ("superagent", "🧠", "Агент"),
     ]
     inst_buttons = []
     for name, icon, label in instruments:
@@ -64,11 +65,6 @@ def platform_menu_keyboard(
         )
 
     rows = [
-        # 🧠 СУПЕРАГЕНТ — top, prominent
-        [InlineKeyboardButton(
-            text="🧠 СУПЕРАГЕНТ",
-            callback_data="platform_superagent",
-        )],
         inst_buttons,
         [InlineKeyboardButton(text=f"🤖 {model_label}", callback_data="platform_model")],
     ]

@@ -149,11 +149,15 @@ def _instrument_hint(instrument: str) -> str:
         ),
         "file_search": (
             "Введите запрос — RAG по выбранным доменам.\n"
-            "Выберите домены в «📁 Домен(ы)» ниже."
+            "Выберите домены в «📁 Файлы» ниже."
         ),
         "web_search": (
             "Введите запрос — веб-поиск через SerpAPI.\n"
             "Ссылки будут кликабельные."
+        ),
+        "superagent": (
+            "🧠 Опишите задачу — построю план и выполню.\n"
+            "Файлы: <code>[имя]</code>. Можно уточнять план."
         ),
     }
     return hints.get(instrument, hints["chat"])
@@ -226,37 +230,10 @@ async def on_platform_instrument_switch(callback: CallbackQuery):
 
 @router.callback_query(F.data == "platform_superagent")
 async def on_platform_superagent(callback: CallbackQuery):
-    """Big button → ask for a goal, then build LangGraph plan.
-
-    Sets a dedicated wait state so the NEXT text message from this
-    user becomes the goal for _handle_task_goal. Any other interaction
-    (button taps, file uploads) is handled normally — the wait state
-    only intercepts plain text.
-    """
-    tg_id = callback.from_user.id
-    modes_svc.set_mode(tg_id, "task")
-    _set_wait(tg_id, "platform_superagent")
-    try:
-        await callback.message.delete()
-    except Exception:  # noqa: BLE001
-        pass
-    await callback.message.bot.send_message(
-        chat_id=callback.message.chat.id,
-        text=(
-            "🧠 <b>С У П Е Р А Г Е Н Т</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Опишите задачу <b>одним сообщением</b>.\n\n"
-            "Я разберу цель → построю полный план (параллели, условия, "
-            "инструменты) → покажу граф → после подтверждения выполню "
-            "step-by-step с критикой каждого шага и alignment-проверкой.\n\n"
-            "📎 Файлы из Памяти: <code>[имя]</code> / <code>[имя@v2]</code>"
-        ),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="platform_menu")],
-        ]),
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer("🧠 Введите задачу")
+    """Legacy: redirect cached keyboards with old callback_data."""
+    instruments_svc.set_active(callback.from_user.id, "superagent")
+    await callback.answer("🧠 Агент")
+    await on_platform_menu(callback)
 
 
 # ── Legacy command shortcuts (kept for keyboard convenience) ─────
@@ -293,11 +270,11 @@ async def cmd_web(message: Message):
 
 @router.message(Command("agent"))
 async def cmd_agent(message: Message):
-    modes_svc.set_mode(message.from_user.id, "task")
-    _set_wait(message.from_user.id, "platform_superagent")
+    instruments_svc.set_active(message.from_user.id, "superagent")
+    _set_wait(message.from_user.id, "platform")
     await message.answer(
-        "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
-        "Опишите задачу — построю план и выполню step-by-step.",
+        "✅ Инструмент: <b>🧠 Агент</b>\n\n"
+        "Опишите задачу — построю план и выполню.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1150,10 +1127,9 @@ async def platform_handle_message(message: Message) -> bool:
         await _show_folder(sent, tg_id, parent_path, page=0)
         return True
 
-    # 0c. СУПЕРАГЕНТ goal input — next text becomes the task goal
-    if wait == "platform_superagent" and message.text:
-        _set_wait(tg_id, "platform")
-        await _handle_task_goal(message)
+    # 0c. СУПЕРАГЕНТ plan refinement — user can send text to refine
+    if wait == "platform_superagent_refine" and message.text:
+        await _handle_task_goal(message)  # regenerates plan with new text
         return True
 
     # 1. New domain name input
@@ -1184,13 +1160,13 @@ async def platform_handle_message(message: Message) -> bool:
         if not message.text:
             return True
         instrument = instruments_svc.get_active(tg_id)
-        if instrument == "web_search":
+        if instrument == "superagent":
+            await _handle_task_goal(message)
+        elif instrument == "web_search":
             await _handle_web_search(message)
         elif instrument == "file_search":
             await _handle_rag_chat(message)
         else:
-            # "chat" = pure LLM with history, NO RAG lookup.
-            # [filename] refs still work (pulled from Memory).
             await _handle_pure_chat(message)
         return True
 
@@ -1374,7 +1350,7 @@ async def _handle_web_search(message: Message) -> None:
     if answer_html:
         parts.append(answer_html)
     if sources_block:
-        parts.append(f"\n<b>Источники:</b>\n{sources_block}")
+        parts.append(f"\n{sources_block}")
     text = "\n\n".join(parts)
     if len(text) > 3800:
         text = text[:3800] + "\n<i>…(обрезано)</i>"
@@ -1393,34 +1369,36 @@ async def _handle_web_search(message: Message) -> None:
 # ── FR-9..11: Task mode — goal → plan preview → approval ─────────
 
 async def _handle_task_goal(message: Message) -> None:
-    """Task mode entry: build full plan, show human-readable preview
-    with an approval keyboard. Execution does NOT start yet (NFR-9)."""
+    """Task mode entry: build full plan, show preview.
+
+    User can either:
+    - ✅ Подтвердить → plan erased, progress bar starts
+    - Send another message → plan regenerated with refinement
+    """
     tg_id = message.from_user.id
     goal = (message.text or "").strip()
     if not goal:
         return
 
+    status = await message.answer("🧠 <i>Строю план…</i>", parse_mode=ParseMode.HTML)
+    _track_msg(tg_id, status.message_id)
+
     session = modes_svc.start_task(tg_id, goal)
 
-    attached_names = [
-        getattr(o, "filename", None) or "—"
-        for o in session.plan.attached_memory
-    ]
-    attached_block = ""
-    if attached_names:
-        attached_block = (
-            "\n\n<b>Подключённая Память:</b>\n"
-            + "\n".join(f"• 📎 <code>{_html.escape(n)}</code>" for n in attached_names)
-        )
-
     preview_html = _html.escape(session.plan.human_readable)
-    await message.answer(
-        f"🎯 <b>Задача</b>\n\n"
-        f"<b>Цель:</b> {_html.escape(goal)}{attached_block}\n\n"
-        f"<pre>{preview_html}</pre>",
+    text = (
+        f"🧠 <b>План</b>\n\n"
+        f"<b>Цель:</b> {_html.escape(goal)}\n\n"
+        f"<pre>{preview_html}</pre>\n\n"
+        "<i>✅ — запустить. Или напишите уточнение — перестрою план.</i>"
+    )
+    await status.edit_text(
+        text,
         reply_markup=task_approval_keyboard(session.id),
         parse_mode=ParseMode.HTML,
     )
+    # Allow refinement: next text message regenerates the plan
+    _set_wait(tg_id, "platform")
 
 
 async def _handle_rag_chat(message: Message) -> None:

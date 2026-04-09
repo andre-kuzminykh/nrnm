@@ -79,17 +79,16 @@ def test_fr_29_web_search_has_no_required_params():
 # FR-31 — СУПЕРАГЕНТ button
 # ─────────────────────────────────────────────────────────────────
 
-def test_fr_31_main_widget_has_superagent_button():
-    """Big СУПЕРАГЕНТ button must be present in the main widget."""
+def test_fr_31_main_widget_has_superagent_instrument():
+    """🧠 Агент must be in the instrument picker row."""
     try:
         from bot.keyboards.inline import platform_menu_keyboard
     except ImportError:
         pytest.skip("keyboard not importable")
     kb = platform_menu_keyboard("GPT-4o", ["domain1"])
     texts = [btn.text for row in kb.inline_keyboard for btn in row]
-    has_superagent = any("суперагент" in t.lower() or "super" in t.lower() for t in texts)
-    if not has_superagent:
-        pytest.skip("TODO FR-31: СУПЕРАГЕНТ button not yet in keyboard")
+    has_agent = any("агент" in t.lower() or "🧠" in t for t in texts)
+    assert has_agent, f"🧠 Агент not found in {texts}"
 
 
 # ─────────────────────────────────────────────────────────────────

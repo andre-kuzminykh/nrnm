@@ -70,8 +70,15 @@ _INSTRUMENTS: dict[str, Instrument] = {
     "web_search": Instrument(
         name="web_search",
         icon="🌐",
-        label="Веб-поиск",
+        label="Веб",
         description="Поиск актуальной информации через SerpAPI.",
+        params={},
+    ),
+    "superagent": Instrument(
+        name="superagent",
+        icon="🧠",
+        label="Агент",
+        description="СУПЕРАГЕНТ: план задачи → LangGraph → step-by-step.",
         params={},
     ),
 }

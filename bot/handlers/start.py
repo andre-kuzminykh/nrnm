@@ -33,7 +33,7 @@ async def cmd_start(message: Message):
 
     await message.answer(
         "👋 <b>Добро пожаловать!</b>\n\n"
-        "Выберите инструмент или запустите 🧠 СУПЕРАГЕНТ.",
+        "Выберите инструмент.",
         reply_markup=platform_menu_keyboard(
             _model_label(user.model_id),
             platform_svc.get_active_domains(tg_id),
