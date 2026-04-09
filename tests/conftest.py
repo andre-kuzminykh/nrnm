@@ -56,6 +56,14 @@ def _isolated_platform_store(monkeypatch):
     except Exception:  # noqa: BLE001
         pass
 
+    # Wipe v2 instruments state.
+    try:
+        import services.instruments as instruments_svc  # noqa: WPS433
+
+        instruments_svc._reset()
+    except Exception:  # noqa: BLE001
+        pass
+
     yield
 
 

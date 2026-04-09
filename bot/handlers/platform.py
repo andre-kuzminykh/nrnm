@@ -40,6 +40,7 @@ from services import modes as modes_svc
 from services import context_resolver
 from services import memory as memory_svc
 from services import mcp_registry
+from services import instruments as instruments_svc
 from bot.keyboards.inline import (
     platform_menu_keyboard,
     platform_model_keyboard,
@@ -108,30 +109,43 @@ def _mode_label(mode: str) -> str:
     return {"chat": "💬 Чат", "task": "🎯 Задачи"}.get(mode, mode)
 
 
+def _instrument_hint(instrument: str) -> str:
+    """Short contextual hint shown in the main widget depending on
+    the active instrument."""
+    hints = {
+        "chat": (
+            "Отправьте сообщение — отвечу с учётом Памяти.\n"
+            "Подключайте файл целиком через <code>[имя_файла]</code> или "
+            "<code>[имя@v2]</code>."
+        ),
+        "file_search": (
+            "Введите запрос — поищу ответ по выбранным доменам (RAG).\n"
+            "Выберите домены в «💾 Память» ниже."
+        ),
+        "web_search": (
+            "Введите запрос — поищу актуальную информацию в вебе "
+            "через SerpAPI."
+        ),
+    }
+    return hints.get(instrument, hints["chat"])
+
+
 def _menu_text(user: platform_svc.PlatformUser, tg_id: int | None = None) -> str:
     active = platform_svc.get_active_domains_for(user)
-    mode = modes_svc.get_mode(tg_id) if tg_id is not None else "chat"
+    instrument = instruments_svc.get_active(tg_id) if tg_id is not None else "chat"
+    inst_obj = instruments_svc.get_instrument(instrument)
+    inst_label = f"{inst_obj.icon} {inst_obj.label}" if inst_obj else instrument
     text = (
         "🧠 <b>ИИ-платформа</b>\n\n"
-        f"<b>Режим:</b> {_mode_label(mode)}\n"
+        f"<b>Инструмент:</b> {inst_label}\n"
         f"<b>Модель:</b> {_html.escape(_model_label(user.model_id))}\n"
         f"<b>Домены:</b> {_html.escape(', '.join(active) or 'не выбраны')}\n\n"
+        f"<i>{_instrument_hint(instrument)}</i>"
     )
-    if mode == "chat":
-        text += (
-            "<i>Отправьте сообщение — отвечу с учётом Памяти.\n"
-            "Подключайте файл целиком через <code>[имя_файла]</code> или "
-            "<code>[имя@v2]</code>. Файл — в чат для загрузки в Память.</i>"
-        )
-    else:
-        text += (
-            "<i>Опишите цель — я построю полный план и покажу его "
-            "перед выполнением. План нужно подтвердить.</i>"
-        )
-    if not rag.is_configured():
+    if not rag.is_configured() and instrument == "file_search":
         text += "\n\n<i>⚠️ RAG не сконфигурирован (QDRANT_URL).</i>"
-    if not active and mode == "chat":
-        text += "\n\n<i>ℹ️ Выберите домен в «💾 Память» чтобы начать диалог.</i>"
+    if not active and instrument == "file_search":
+        text += "\n\n<i>ℹ️ Выберите домен в «💾 Память» чтобы начать RAG-поиск.</i>"
     return text
 
 
@@ -156,53 +170,104 @@ async def on_platform_menu(callback: CallbackQuery):
         reply_markup=platform_menu_keyboard(
             _model_label(user.model_id),
             platform_svc.get_active_domains(tg_id),
-            active_mode=modes_svc.get_mode(tg_id),
+            active_instrument=instruments_svc.get_active(tg_id),
         ),
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
 
 
-# ── FR-6 / FR-9 / Rule 2: mode toggle ────────────────────────────
+# ── FR-28: instrument picker ──────────────────────────────────────
 
-@router.callback_query(F.data.startswith("platform_mode:"))
-async def on_platform_mode_switch(callback: CallbackQuery):
-    mode = callback.data.split(":", 1)[1]
+@router.callback_query(F.data.startswith("platform_instrument:"))
+async def on_platform_instrument_switch(callback: CallbackQuery):
+    name = callback.data.split(":", 1)[1]
     try:
-        modes_svc.set_mode(callback.from_user.id, mode)
+        instruments_svc.set_active(callback.from_user.id, name)
     except ValueError as e:
         await callback.answer(str(e), show_alert=True)
         return
-    await callback.answer(f"Режим: {_mode_label(mode)}")
+    inst = instruments_svc.get_instrument(name)
+    label = f"{inst.icon} {inst.label}" if inst else name
+    await callback.answer(f"Инструмент: {label}")
     await on_platform_menu(callback)
 
 
+# ── FR-31: СУПЕРАГЕНТ entry point ────────────────────────────────
+
+@router.callback_query(F.data == "platform_superagent")
+async def on_platform_superagent(callback: CallbackQuery):
+    """Big button → switch to task/superagent mode and ask for a goal."""
+    tg_id = callback.from_user.id
+    modes_svc.set_mode(tg_id, "task")
+    _set_wait(tg_id, "platform_superagent")
+    await _replace_widget(
+        callback.message,
+        "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
+        "<i>Опишите задачу — я построю полный план (с параллелизмом, "
+        "условиями, инструментами), покажу его, и после вашего "
+        "подтверждения выполню step-by-step с критикой каждого шага.</i>\n\n"
+        "Подключайте файлы через <code>[имя_файла]</code> или "
+        "<code>[имя@v2]</code>.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="platform_menu")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+# ── Legacy command shortcuts (kept for keyboard convenience) ─────
+
 @router.message(Command("chat"))
 async def cmd_chat(message: Message):
-    modes_svc.set_mode(message.from_user.id, "chat")
+    instruments_svc.set_active(message.from_user.id, "chat")
     await message.answer(
-        f"✅ Режим: <b>{_mode_label('chat')}</b>\n\n"
+        "✅ Инструмент: <b>💬 Чат</b>\n\n"
         "Пишите вопрос — отвечу с учётом Памяти.",
         parse_mode=ParseMode.HTML,
     )
 
 
-@router.message(Command("task"))
-async def cmd_task(message: Message):
-    modes_svc.set_mode(message.from_user.id, "task")
+@router.message(Command("search"))
+async def cmd_search(message: Message):
+    instruments_svc.set_active(message.from_user.id, "file_search")
     await message.answer(
-        f"✅ Режим: <b>{_mode_label('task')}</b>\n\n"
-        "Опишите цель — построю план и покажу перед выполнением.",
+        "✅ Инструмент: <b>🔍 Поиск по файлам</b>\n\n"
+        "Введите запрос — поищу в выбранных доменах.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("web"))
+async def cmd_web(message: Message):
+    instruments_svc.set_active(message.from_user.id, "web_search")
+    await message.answer(
+        "✅ Инструмент: <b>🌐 Веб-поиск</b>\n\n"
+        "Введите запрос — поищу актуальную информацию в вебе.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("agent"))
+async def cmd_agent(message: Message):
+    modes_svc.set_mode(message.from_user.id, "task")
+    _set_wait(message.from_user.id, "platform_superagent")
+    await message.answer(
+        "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
+        "Опишите задачу — построю план и выполню step-by-step.",
         parse_mode=ParseMode.HTML,
     )
 
 
 @router.message(Command("mode"))
 async def cmd_mode(message: Message):
-    mode = modes_svc.get_mode(message.from_user.id)
+    inst = instruments_svc.get_active(message.from_user.id)
+    inst_obj = instruments_svc.get_instrument(inst)
+    label = f"{inst_obj.icon} {inst_obj.label}" if inst_obj else inst
     await message.answer(
-        f"Текущий режим: <b>{_mode_label(mode)}</b>\n\n"
-        "Переключение: /chat или /task",
+        f"Текущий инструмент: <b>{label}</b>\n\n"
+        "Переключение: /chat, /search, /web, /agent",
         parse_mode=ParseMode.HTML,
     )
 
@@ -797,6 +862,12 @@ async def platform_handle_message(message: Message) -> bool:
         if handled:
             return True
 
+    # 0b. СУПЕРАГЕНТ goal input — next text becomes the task goal
+    if wait == "platform_superagent" and message.text:
+        _set_wait(tg_id, "platform")
+        await _handle_task_goal(message)
+        return True
+
     # 1. New domain name input
     if wait == "new_domain" and message.text:
         name = message.text.strip()
@@ -817,21 +888,83 @@ async def platform_handle_message(message: Message) -> bool:
         )
         return True
 
-    # 2. Platform — route by active mode
+    # 2. Platform — route by active INSTRUMENT (FR-28)
     if wait == "platform":
         if message.document:
             await _ingest_file(message)
             return True
         if not message.text:
             return True
-        mode = modes_svc.get_mode(tg_id)
-        if mode == "task":
-            await _handle_task_goal(message)
+        instrument = instruments_svc.get_active(tg_id)
+        if instrument == "web_search":
+            await _handle_web_search(message)
+        elif instrument == "file_search":
+            await _handle_rag_chat(message)
         else:
+            # "chat" — same RAG path with context ref support
             await _handle_rag_chat(message)
         return True
 
     return False
+
+
+# ── FR-28: web_search instrument handler ─────────────────────────
+
+async def _handle_web_search(message: Message) -> None:
+    """Web search instrument — calls SerpAPI via MCP and shows results
+    with clickable hyperlinks (FR-36)."""
+    tg_id = message.from_user.id
+    query = (message.text or "").strip()
+    if not query:
+        return
+
+    status = await message.answer("🌐 Ищу в вебе…")
+    try:
+        from services import mcp_registry, mcp_client
+
+        # Look up web_search MCP in the first active domain
+        active = platform_svc.get_active_domains(tg_id)
+        domain = active[0] if active else None
+        entry = None
+        if domain:
+            entry = mcp_registry.get_mcp(tg_id, domain, "web_search")
+        if entry is None:
+            # Fallback: direct tool call
+            from services import tools
+            result = tools.call("web_search", {"query": query})
+        else:
+            result = mcp_client.dispatch(entry, {"query": query})
+    except Exception as exc:  # noqa: BLE001
+        await status.edit_text(f"❌ Ошибка поиска: {_html.escape(str(exc)[:300])}")
+        return
+
+    if result.status != "ok":
+        await status.edit_text(
+            f"❌ Поиск не удался: {_html.escape(result.error or 'unknown')}",
+        )
+        return
+
+    hits = (result.output or {}).get("hits") or []
+    if not hits:
+        await status.edit_text("Ничего не найдено.")
+        return
+
+    # FR-36: render results with clickable hyperlinks
+    lines = [f"🌐 <b>Результаты по запросу:</b> <i>{_html.escape(query)}</i>\n"]
+    for i, hit in enumerate(hits[:8], 1):
+        title = _html.escape(hit.get("title") or "(без заголовка)")
+        url = hit.get("url") or ""
+        snippet = _html.escape((hit.get("snippet") or "")[:200])
+        if url:
+            lines.append(f"{i}. <a href=\"{_html.escape(url)}\">{title}</a>")
+        else:
+            lines.append(f"{i}. <b>{title}</b>")
+        if snippet:
+            lines.append(f"   <i>{snippet}</i>")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n<i>…(обрезано)</i>"
+    await status.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 # ── FR-9..11: Task mode — goal → plan preview → approval ─────────
@@ -1035,6 +1168,24 @@ def _dedupe_sources(top: list[dict]) -> list[dict]:
             "domain": h.get("domain", ""),
         })
     return out
+
+
+def _render_answer_with_hyperlinks(text: str) -> str:
+    """FR-36: wrap every http(s):// URL in the text with an HTML <a>
+    tag so Telegram renders it as a clickable hyperlink. Also strips
+    any stray [N] markers the LLM might produce."""
+    import re
+
+    escaped = _html.escape(text)
+    # Strip stray [N] markers
+    escaped = re.sub(r"\s*\[\d+\]", "", escaped)
+    # Linkify URLs — match http:// and https:// up to whitespace or <
+    escaped = re.sub(
+        r"(https?://[^\s<\"]+)",
+        r'<a href="\1">\1</a>',
+        escaped,
+    )
+    return escaped
 
 
 def _render_answer_with_inline_sources(answer: str, filenames: list[str]) -> str:

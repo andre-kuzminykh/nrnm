@@ -20,20 +20,53 @@ def platform_menu_keyboard(
     active_model: str,
     active_domains: list[str],
     active_mode: str = "chat",
+    active_instrument: str = "chat",
 ) -> InlineKeyboardMarkup:
-    """FR-P1 / FR-P11 / FR-6 / FR-9: main platform widget.
+    """FR-28 / FR-30 / FR-31: main platform widget.
 
-    Adds a v1 mode toggle at the very top — the two modes are Чат and
-    Задачи (Rule 2). Active mode shown with ✅."""
+    Layout (top to bottom):
+    1. **Instrument picker row** — three instruments in a row:
+       💬 Чат | 🔍 Файлы | 🌐 Веб. Active one marked with ✅.
+    2. **🤖 СУПЕРАГЕНТ** — big standalone button (FR-31). Starts the
+       full LangGraph pipeline with goal input.
+    3. **🤖 Model picker**
+    4. **💾 Память** — under the instrument block (FR-30).
+    5. **🔄 Сбросить контекст**
+    6. **◀️ Главное меню**
+
+    `active_mode` is accepted for backwards compat but mapped to
+    `active_instrument` internally. New code should pass
+    `active_instrument` directly.
+    """
+    # Backwards compat: map old mode names to instruments
+    if active_instrument == "chat" and active_mode != "chat":
+        active_instrument = active_mode
+
     model_label = active_model or "не выбрана"
     doms = ", ".join(active_domains) if active_domains else "не выбран"
-    chat_mark = "✅ " if active_mode == "chat" else ""
-    task_mark = "✅ " if active_mode == "task" else ""
+
+    # Instrument picker row
+    instruments = [
+        ("chat", "💬", "Чат"),
+        ("file_search", "🔍", "Файлы"),
+        ("web_search", "🌐", "Веб"),
+    ]
+    inst_buttons = []
+    for name, icon, label in instruments:
+        mark = "✅ " if name == active_instrument else ""
+        inst_buttons.append(
+            InlineKeyboardButton(
+                text=f"{mark}{icon} {label}",
+                callback_data=f"platform_instrument:{name}",
+            )
+        )
+
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"{chat_mark}💬 Чат", callback_data="platform_mode:chat"),
-            InlineKeyboardButton(text=f"{task_mark}🎯 Задачи", callback_data="platform_mode:task"),
-        ],
+        inst_buttons,
+        [InlineKeyboardButton(
+            text="🤖 СУПЕРАГЕНТ",
+            callback_data="platform_superagent",
+        )],
         [InlineKeyboardButton(text=f"🤖 {model_label}", callback_data="platform_model")],
         [InlineKeyboardButton(text=f"💾 Память: {doms}", callback_data="platform_memory")],
         [InlineKeyboardButton(text="🔄 Сбросить контекст", callback_data="platform_reset")],
