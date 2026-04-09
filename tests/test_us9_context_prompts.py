@@ -120,6 +120,31 @@ def test_fr_44_superagent_refinement_includes_original_goal():
     _PLAN_HISTORY.pop(tg_id, None)
 
 
+def test_safe_html_relinkifies_after_strip():
+    """_safe_html should re-create hyperlinks even after stripping
+    broken tags, so URLs are always clickable."""
+    try:
+        from bot.handlers.platform import _safe_html
+    except ImportError:
+        pytest.skip("handler not importable")
+
+    # Simulate broken HTML (unclosed tag)
+    broken = (
+        '<b>Title</b>\n'
+        'Text <a href="https://example.com">link\n'  # unclosed <a>!
+        '[1] Source — https://source.com/report\n'
+        'Bare https://bare.url/here end.'
+    )
+    result = _safe_html(broken)
+    # Should NOT contain unclosed tags
+    assert "<a>" not in result or "</a>" in result
+    # URLs should still be clickable hyperlinks
+    assert '<a href="https://source.com/report">' in result
+    assert '<a href="https://bare.url/here">' in result
+    # [1] should be bold
+    assert "<b>[1]</b>" in result
+
+
 def test_fr_44_md_to_html_handles_citations_and_sources():
     """_md_to_html should:
     - Bold [N] inline citations

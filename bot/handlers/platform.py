@@ -1975,18 +1975,41 @@ def _extract_synthesis_text(run) -> str | None:
 
 
 def _safe_html(text: str) -> str:
-    """Validate that text is parseable Telegram HTML. If not, strip all
-    tags and return plain escaped text. Prevents 'Unclosed start tag'
-    crashes from LLM-generated content with broken URLs."""
+    """Ensure text is valid Telegram HTML.
+
+    Strategy:
+    1. Check tag balance. If broken → strip all tags.
+    2. After stripping, re-linkify bare URLs as <a href> and
+       re-bold [N] source references. This way even if the original
+       _md_to_html produced broken HTML, the user still gets
+       clickable hyperlinks and readable formatting.
+    """
     import re
-    # Quick check: count open vs close tags
+
     opens = len(re.findall(r"<[a-z]", text))
     closes = len(re.findall(r"</[a-z]", text))
-    self_close = len(re.findall(r"/>", text))
-    if opens != closes + self_close:
-        # Broken HTML — strip all tags, return plain text
-        plain = re.sub(r"<[^>]+>", "", text)
-        return plain
+    if opens != closes:
+        # Broken — strip all tags, then re-format from scratch
+        text = re.sub(r"<[^>]+>", "", text)
+        # Escape for Telegram HTML
+        text = _html.escape(text)
+        # Source lines: [N] Title — URL → [N] <a href>Title</a>
+        text = re.sub(
+            r"\[(\d+)\]\s+(.+?)\s*[—–\-]\s*(https?://[^\s]+)",
+            lambda m: (
+                f'<b>[{m.group(1)}]</b> '
+                f'<a href="{m.group(3).rstrip(".,;:!?")}">{m.group(2).strip()}</a>'
+            ),
+            text,
+        )
+        # Bare URLs that aren't already inside <a>
+        def _linkify_bare(m):
+            url = m.group(1).rstrip(".,;:!?)")
+            after = m.group(0)[len(m.group(1)):]
+            return f'<a href="{url}">{url}</a>{after}'
+        text = re.sub(r"(?<!href=\")(https?://[^\s<]+)", _linkify_bare, text)
+        # Bold [N] inline citations (skip those already inside <b> from source lines)
+        text = re.sub(r"(?<!<b>)\[(\d+)\](?!</b>)", r"<b>[\1]</b>", text)
     return text
 
 
@@ -2172,16 +2195,24 @@ async def on_task_approve(callback: CallbackQuery):
             disable_web_page_preview=True,
         )
     except TelegramBadRequest:
-        # HTML still broken after sanitize — send as plain text
+        # Last resort: strip → re-linkify → try again
         import re
         plain = re.sub(r"<[^>]+>", "", final_text)
+        # Re-add hyperlinks on bare URLs so they're still clickable
+        linked = re.sub(
+            r"(https?://[^\s]+?)([.,;:!?)\s]|$)",
+            r'<a href="\1">\1</a>\2',
+            _html.escape(plain),
+        )
         try:
             await status.edit_text(
-                plain[:4000],
+                linked[:4000],
                 reply_markup=platform_answer_keyboard(),
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
         except Exception:  # noqa: BLE001
+            # Absolute last resort — no HTML at all
             await callback.message.answer(plain[:4000])
 
 
