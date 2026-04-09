@@ -42,6 +42,8 @@ from services import memory as memory_svc
 from services import mcp_registry
 from services import instruments as instruments_svc
 from services import file_tree as file_tree_svc
+from services import prompt_loader
+from services import web_search_ctx
 from bot.keyboards.inline import (
     platform_menu_keyboard,
     platform_model_keyboard,
@@ -1235,14 +1237,7 @@ async def _handle_pure_chat(message: Message) -> None:
 
     messages = [{
         "role": "system",
-        "content": (
-            "Ты — ИИ-помощник. Отвечай кратко и по делу. "
-            "Если пользователь подключил файл через [имя] — секция "
-            "[ПОЛНЫЙ ФАЙЛ] или [СВОД] содержит его содержимое, используй "
-            "его как основной источник. "
-            "Никогда не ставь маркеры [1], [2]. "
-            "Если контекста нет — просто общайся."
-        ),
+        "content": prompt_loader.load("chat"),
     }]
     messages.extend(user.chat_history[-10:-1])
 
@@ -1277,29 +1272,45 @@ async def _handle_pure_chat(message: Message) -> None:
 # ── FR-28: web_search instrument handler ─────────────────────────
 
 async def _handle_web_search(message: Message) -> None:
-    """Web search instrument — calls SerpAPI via MCP and shows results
-    with clickable hyperlinks (FR-36)."""
+    """Web search instrument — context-aware (FR-44).
+
+    Flow:
+    1. Save user message to history.
+    2. Build a context-aware search query from history + current msg.
+    3. Call SerpAPI via MCP.
+    4. Synthesise an answer via LLM using search results + history.
+    5. Render with hyperlinks (FR-36), save to history.
+    """
     tg_id = message.from_user.id
-    query = (message.text or "").strip()
-    if not query:
+    user = platform_svc.get_user(tg_id)
+    raw_query = (message.text or "").strip()
+    if not raw_query:
         return
 
+    platform_svc.add_chat_message(tg_id, "user", raw_query)
+
     status = await message.answer("🌐 Ищу в вебе…")
+
+    # FR-44: expand follow-up queries using dialog history
+    search_query = web_search_ctx.build_search_query(
+        current_message=raw_query,
+        history=user.chat_history,
+    )
+
+    # Call SerpAPI
     try:
         from services import mcp_registry, mcp_client
 
-        # Look up web_search MCP in the first active domain
         active = platform_svc.get_active_domains(tg_id)
         domain = active[0] if active else None
         entry = None
         if domain:
             entry = mcp_registry.get_mcp(tg_id, domain, "web_search")
         if entry is None:
-            # Fallback: direct tool call
             from services import tools
-            result = tools.call("web_search", {"query": query})
+            result = tools.call("web_search", {"query": search_query})
         else:
-            result = mcp_client.dispatch(entry, {"query": query})
+            result = mcp_client.dispatch(entry, {"query": search_query})
     except Exception as exc:  # noqa: BLE001
         await status.edit_text(f"❌ Ошибка поиска: {_html.escape(str(exc)[:300])}")
         return
@@ -1315,23 +1326,59 @@ async def _handle_web_search(message: Message) -> None:
         await status.edit_text("Ничего не найдено.")
         return
 
-    # FR-36: render results with clickable hyperlinks
-    lines = [f"🌐 <b>Результаты по запросу:</b> <i>{_html.escape(query)}</i>\n"]
-    for i, hit in enumerate(hits[:8], 1):
-        title = _html.escape(hit.get("title") or "(без заголовка)")
+    # Synthesise an answer using LLM + search results + history (FR-44)
+    hits_text = "\n\n".join(
+        f"[{hit.get('title', '')}]({hit.get('url', '')})\n{hit.get('snippet', '')}"
+        for hit in hits[:6]
+    )
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
+
+        llm_messages = [{"role": "system", "content": prompt_loader.load("web_search")}]
+        llm_messages.extend(user.chat_history[-8:-1])
+        llm_messages.append({
+            "role": "user",
+            "content": (
+                f"Результаты веб-поиска по запросу «{search_query}»:\n\n"
+                f"{hits_text}\n\n"
+                f"Вопрос пользователя: {raw_query}"
+            ),
+        })
+
+        resp = await client.chat.completions.create(
+            model=user.model_id, messages=llm_messages, temperature=0.3,
+        )
+        answer = resp.choices[0].message.content or "(пусто)"
+    except Exception as exc:  # noqa: BLE001
+        # Fallback: just show raw hits
+        answer = ""
+        logger.warning("web_search LLM synthesis failed: %s", exc)
+
+    platform_svc.add_chat_message(tg_id, "assistant", answer or hits_text)
+
+    # Render: LLM answer + source links below
+    answer_html = _render_answer_with_hyperlinks(answer) if answer else ""
+    source_lines = []
+    for hit in hits[:6]:
+        title = _html.escape(hit.get("title") or "")
         url = hit.get("url") or ""
-        snippet = _html.escape((hit.get("snippet") or "")[:200])
         if url:
-            lines.append(f"{i}. <a href=\"{_html.escape(url)}\">{title}</a>")
-        else:
-            lines.append(f"{i}. <b>{title}</b>")
-        if snippet:
-            lines.append(f"   <i>{snippet}</i>")
-    text = "\n".join(lines)
+            source_lines.append(f'• <a href="{_html.escape(url)}">{title}</a>')
+    sources_block = "\n".join(source_lines)
+
+    parts = [f"🌐 <b>{_html.escape(_model_label(user.model_id))}</b>"]
+    if search_query != raw_query:
+        parts.append(f"<i>Запрос: {_html.escape(search_query)}</i>")
+    if answer_html:
+        parts.append(answer_html)
+    if sources_block:
+        parts.append(f"\n<b>Источники:</b>\n{sources_block}")
+    text = "\n\n".join(parts)
     if len(text) > 3800:
         text = text[:3800] + "\n<i>…(обрезано)</i>"
-    # Stash the answer so "💾 Сохранить в память" has something to save
-    user = platform_svc.get_user(tg_id)
+
     user.last_answer = text
     platform_svc._persist()
     await status.edit_text(
@@ -1459,16 +1506,7 @@ async def _handle_rag_chat(message: Message) -> None:
     # Build chat history for LLM (system + last 10 turns + current context)
     messages = [{
         "role": "system",
-        "content": (
-            "Ты — помощник, отвечающий на основе контекста из базы знаний пользователя. "
-            "Если в контексте есть секция [ПОЛНЫЙ ФАЙЛ] или [СВОД] — это явно подключённый "
-            "пользователем файл, используй его как основной источник. "
-            "Если ссылаешься на файл, просто упомяни его название в обычном предложении, "
-            "например «в файле report.pdf сказано, что…». "
-            "НИКОГДА не ставь маркеры вида [1], [2] — номера источников не нужны, "
-            "пользователь попадёт в оригинал через quote-preview Telegram. "
-            "Если в контексте нет ответа — так и скажи, не выдумывай."
-        ),
+        "content": prompt_loader.load("file_search"),
     }]
     messages.extend(user.chat_history[-10:-1])  # prior turns
     messages.append({
