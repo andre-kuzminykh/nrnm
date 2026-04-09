@@ -64,6 +64,14 @@ def _isolated_platform_store(monkeypatch):
     except Exception:  # noqa: BLE001
         pass
 
+    # Wipe v2 file tree state.
+    try:
+        import services.file_tree as file_tree_svc  # noqa: WPS433
+
+        file_tree_svc._reset()
+    except Exception:  # noqa: BLE001
+        pass
+
     yield
 
 

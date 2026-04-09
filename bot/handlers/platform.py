@@ -41,6 +41,7 @@ from services import context_resolver
 from services import memory as memory_svc
 from services import mcp_registry
 from services import instruments as instruments_svc
+from services import file_tree as file_tree_svc
 from bot.keyboards.inline import (
     platform_menu_keyboard,
     platform_model_keyboard,
@@ -54,6 +55,8 @@ from bot.keyboards.inline import (
     platform_mcp_cancel_keyboard,
     task_approval_keyboard,
     task_reapproval_keyboard,
+    file_tree_keyboard,
+    file_context_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -496,6 +499,125 @@ async def on_platform_doc_delete(callback: CallbackQuery):
     await on_platform_domain_open(callback)
 
 
+# ── FR-39..43: File tree navigation + scoped chat ────────────────
+
+# Per-user current path in the file tree. When set, RAG is scoped to
+# this path. None or "/" = all files.
+_USER_TREE_PATH: dict[int, str] = {}
+
+
+def _get_tree_path(tg_id: int) -> str:
+    return _USER_TREE_PATH.get(tg_id, "/")
+
+
+def _set_tree_path(tg_id: int, path: str) -> None:
+    _USER_TREE_PATH[tg_id] = path
+
+
+def _breadcrumb(path: str) -> str:
+    """Render a path as a readable breadcrumb: / → 🏠, /a/b → 🏠 › a › b"""
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return "🏠 Корень"
+    return "🏠 › " + " › ".join(parts)
+
+
+@router.callback_query(F.data.startswith("ftree:"))
+async def on_ftree_navigate(callback: CallbackQuery):
+    """Navigate into a folder or open a file context."""
+    tg_id = callback.from_user.id
+    path = callback.data.split(":", 1)[1]
+    node = file_tree_svc._resolve(tg_id, path)
+
+    if node is None:
+        # Path doesn't exist yet — treat as root
+        path = "/"
+        node = file_tree_svc._root(tg_id)
+
+    _set_tree_path(tg_id, path)
+    _set_wait(tg_id, "platform")
+
+    if node.is_folder:
+        children = file_tree_svc.list_children(tg_id, path)
+        parent_path = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
+        if path == "/":
+            parent_path = None  # root has no parent — "back" goes to menu
+
+        file_count = len(file_tree_svc.get_scope(tg_id, path))
+        text = (
+            f"📁 <b>{_breadcrumb(path)}</b>\n\n"
+            f"Файлов: {file_count} (рекурсивно)\n\n"
+            "<i>Отправьте файл — он попадёт в эту папку.\n"
+            "Напишите вопрос — RAG будет искать только здесь.</i>"
+        )
+        await _replace_widget(
+            callback.message, text,
+            reply_markup=file_tree_keyboard(path, children, parent_path),
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        # Single file context
+        parent_path = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
+        text = (
+            f"📄 <b>{_html.escape(node.name)}</b>\n\n"
+            f"Путь: <code>{_html.escape(path)}</code>\n"
+            f"Фрагментов: {node.num_chunks}\n"
+            f"ID: <code>{node.doc_id}</code>\n\n"
+            "<i>Напишите вопрос — отвечу только по этому файлу.</i>"
+        )
+        await _replace_widget(
+            callback.message, text,
+            reply_markup=file_context_keyboard(path, parent_path),
+            parse_mode=ParseMode.HTML,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ftree_mkdir:"))
+async def on_ftree_mkdir(callback: CallbackQuery):
+    """Create a new subfolder — ask for the name."""
+    tg_id = callback.from_user.id
+    parent_path = callback.data.split(":", 1)[1]
+    _set_wait(tg_id, "ftree_mkdir")
+    _USER_TREE_PATH[tg_id] = parent_path  # remember where to create
+    await _replace_widget(
+        callback.message,
+        f"📁 <b>Новая папка в {_breadcrumb(parent_path)}</b>\n\n"
+        "Отправьте название папки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"ftree:{parent_path}")],
+        ]),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ftree_scope:"))
+async def on_ftree_select_all(callback: CallbackQuery):
+    """📎 Выбрать все — set the RAG scope to this folder and confirm."""
+    tg_id = callback.from_user.id
+    path = callback.data.split(":", 1)[1]
+    _set_tree_path(tg_id, path)
+    scope = file_tree_svc.get_scope(tg_id, path)
+    await callback.answer(
+        f"📎 Scope: {len(scope)} файлов из {_breadcrumb(path)}",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data.startswith("ftree_delete:"))
+async def on_ftree_delete(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    path = callback.data.split(":", 1)[1]
+    name = path.rstrip("/").split("/")[-1]
+    parent_path = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
+    file_tree_svc.delete_node(tg_id, path)
+    _set_tree_path(tg_id, parent_path)
+    await callback.answer(f"Удалено: {name}")
+    callback.data = f"ftree:{parent_path}"
+    await on_ftree_navigate(callback)
+
+
 # ── FR-23/24: MCP management ────────────────────────────────────
 
 def _mcp_wait_key(tg_id: int) -> str:
@@ -916,9 +1038,16 @@ async def _ingest_file(message: Message) -> None:
     # FR-5: stash the full extracted body so [контекст]/[file] can pull
     # the whole document later without re-downloading / re-parsing.
     memory_svc.set_object_content(doc.doc_id, text_content)
+    # FR-43: also register the file in the tree at the user's current path
+    tree_path = _get_tree_path(tg_id)
+    try:
+        file_tree_svc.add_file(tg_id, tree_path, filename, doc.doc_id, n_chunks)
+    except ValueError:
+        # Tree path doesn't exist — add to root
+        file_tree_svc.add_file(tg_id, "/", filename, doc.doc_id, n_chunks)
     await status.edit_text(
-        f"✅ <b>{_html.escape(filename)}</b> — {n_chunks} фрагментов в домене "
-        f"<b>{_html.escape(domain_name)}</b>.",
+        f"✅ <b>{_html.escape(filename)}</b> — {n_chunks} фрагментов "
+        f"в <b>{_breadcrumb(tree_path)}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -940,7 +1069,23 @@ async def platform_handle_message(message: Message) -> bool:
         if handled:
             return True
 
-    # 0b. СУПЕРАГЕНТ goal input — next text becomes the task goal
+    # 0b. File tree: mkdir name input
+    if wait == "ftree_mkdir" and message.text:
+        name = message.text.strip()
+        parent_path = _get_tree_path(tg_id)
+        try:
+            file_tree_svc.create_folder(tg_id, parent_path, name)
+        except ValueError as e:
+            await message.answer(f"❌ {e}")
+            return True
+        _set_wait(tg_id, "platform")
+        await message.answer(
+            f"✅ Папка <b>{_html.escape(name)}</b> создана в {_breadcrumb(parent_path)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    # 0c. СУПЕРАГЕНТ goal input — next text becomes the task goal
     if wait == "platform_superagent" and message.text:
         _set_wait(tg_id, "platform")
         await _handle_task_goal(message)

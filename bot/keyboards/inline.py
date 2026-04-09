@@ -73,11 +73,11 @@ def platform_menu_keyboard(
         [InlineKeyboardButton(text=f"🤖 {model_label}", callback_data="platform_model")],
     ]
 
-    # Domain selector only for the "Память" (file_search) instrument
+    # File tree selector only for the "Память" (file_search) instrument
     if active_instrument == "file_search":
         rows.append([InlineKeyboardButton(
-            text=dom_button_text,
-            callback_data="platform_memory",
+            text="📁 Файлы",
+            callback_data="ftree:/",
         )])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -208,6 +208,78 @@ def platform_doc_keyboard(domain_idx: int, doc_idx: int) -> InlineKeyboardMarkup
                               callback_data=f"platform_doc_delete:{domain_idx}:{doc_idx}")],
         [InlineKeyboardButton(text="◀️ Назад",
                               callback_data=f"platform_domain_open:{domain_idx}")],
+    ])
+
+
+# ── FR-39..43: File tree keyboards ────────────────────────────────
+
+def file_tree_keyboard(
+    path: str,
+    children: list,
+    parent_path: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Navigation keyboard for a folder in the file tree.
+
+    Shows:
+    - 📂 subfolders (tap = enter)
+    - 📄 files (tap = enter file context)
+    - ➕ Папка — create a new subfolder
+    - 📎 Выбрать все — select all files in this folder for RAG
+    - ◀️ Назад — go up one level (or back to main menu if at root)
+    """
+    buttons = []
+
+    # Children: folders first, then files
+    folders = sorted([c for c in children if c.is_folder], key=lambda c: c.name)
+    files = sorted([c for c in children if not c.is_folder], key=lambda c: c.name)
+
+    for f in folders:
+        buttons.append([InlineKeyboardButton(
+            text=f"📂 {f.name}",
+            callback_data=f"ftree:{f.path}",
+        )])
+    for f in files:
+        label = f"📄 {f.name}"
+        if f.num_chunks:
+            label += f" ({f.num_chunks} фр.)"
+        buttons.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"ftree:{f.path}",
+        )])
+
+    # Action buttons
+    buttons.append([
+        InlineKeyboardButton(text="➕ Папка", callback_data=f"ftree_mkdir:{path}"),
+        InlineKeyboardButton(text="📎 Выбрать все", callback_data=f"ftree_scope:{path}"),
+    ])
+
+    # Back button
+    if parent_path is not None:
+        buttons.append([InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data=f"ftree:{parent_path}",
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(
+            text="◀️ К меню",
+            callback_data="platform_menu",
+        )])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def file_context_keyboard(file_path: str, parent_path: str) -> InlineKeyboardMarkup:
+    """Keyboard shown when user enters a single file context.
+    They can chat within this file's scope or go back."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🗑 Удалить файл",
+            callback_data=f"ftree_delete:{file_path}",
+        )],
+        [InlineKeyboardButton(
+            text="◀️ Назад",
+            callback_data=f"ftree:{parent_path}",
+        )],
     ])
 
 
