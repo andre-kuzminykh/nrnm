@@ -107,7 +107,7 @@ _USER_INSTRUMENT: dict[int, str] = {}
 
 
 def get_active(tg_id: int) -> str:
-    return _USER_INSTRUMENT.get(tg_id, "chat")
+    return _USER_INSTRUMENT.get(tg_id, "superagent")
 
 
 def set_active(tg_id: int, name: str) -> str:
