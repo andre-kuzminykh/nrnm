@@ -61,17 +61,30 @@ def platform_menu_keyboard(
             )
         )
 
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         inst_buttons,
         [InlineKeyboardButton(
             text="🤖 СУПЕРАГЕНТ",
             callback_data="platform_superagent",
         )],
         [InlineKeyboardButton(text=f"🤖 {model_label}", callback_data="platform_model")],
-        [InlineKeyboardButton(text=f"💾 Память: {doms}", callback_data="platform_memory")],
-        [InlineKeyboardButton(text="🔄 Сбросить контекст", callback_data="platform_reset")],
-        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")],
-    ])
+    ]
+
+    # FR-30: Memory button only visible when file_search is active —
+    # other instruments don't need domain selection.
+    if active_instrument == "file_search":
+        rows.append([InlineKeyboardButton(
+            text=f"💾 Память: {doms}",
+            callback_data="platform_memory",
+        )])
+
+    rows.append([InlineKeyboardButton(
+        text="🔄 Сбросить контекст",
+        callback_data="platform_reset",
+    )])
+    # No "◀️ Главное меню" — this widget IS the main menu.
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def task_approval_keyboard(session_id: str) -> InlineKeyboardMarkup:

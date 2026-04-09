@@ -114,17 +114,18 @@ def _instrument_hint(instrument: str) -> str:
     the active instrument."""
     hints = {
         "chat": (
-            "Отправьте сообщение — отвечу с учётом Памяти.\n"
-            "Подключайте файл целиком через <code>[имя_файла]</code> или "
-            "<code>[имя@v2]</code>."
+            "Просто пишите — отвечу с диалогом и историей.\n"
+            "Подключайте файл через <code>[имя_файла]</code> или "
+            "<code>[имя@v2]</code>.\n"
+            "<i>Память (RAG) не используется — только LLM + контекст.</i>"
         ),
         "file_search": (
             "Введите запрос — поищу ответ по выбранным доменам (RAG).\n"
             "Выберите домены в «💾 Память» ниже."
         ),
         "web_search": (
-            "Введите запрос — поищу актуальную информацию в вебе "
-            "через SerpAPI."
+            "Введите запрос — поищу актуальную информацию "
+            "через SerpAPI. Ссылки будут кликабельные."
         ),
     }
     return hints.get(instrument, hints["chat"])
@@ -197,24 +198,37 @@ async def on_platform_instrument_switch(callback: CallbackQuery):
 
 @router.callback_query(F.data == "platform_superagent")
 async def on_platform_superagent(callback: CallbackQuery):
-    """Big button → switch to task/superagent mode and ask for a goal."""
+    """Big button → ask for a goal, then build LangGraph plan.
+
+    Sets a dedicated wait state so the NEXT text message from this
+    user becomes the goal for _handle_task_goal. Any other interaction
+    (button taps, file uploads) is handled normally — the wait state
+    only intercepts plain text.
+    """
     tg_id = callback.from_user.id
     modes_svc.set_mode(tg_id, "task")
     _set_wait(tg_id, "platform_superagent")
-    await _replace_widget(
-        callback.message,
-        "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
-        "<i>Опишите задачу — я построю полный план (с параллелизмом, "
-        "условиями, инструментами), покажу его, и после вашего "
-        "подтверждения выполню step-by-step с критикой каждого шага.</i>\n\n"
-        "Подключайте файлы через <code>[имя_файла]</code> или "
-        "<code>[имя@v2]</code>.",
+    try:
+        await callback.message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    await callback.message.bot.send_message(
+        chat_id=callback.message.chat.id,
+        text=(
+            "🤖 <b>СУПЕРАГЕНТ</b>\n\n"
+            "Опишите задачу одним сообщением.\n\n"
+            "Я построю план (шаги, параллели, инструменты), "
+            "покажу его, и после подтверждения выполню step-by-step "
+            "с критикой каждого шага.\n\n"
+            "💡 Подключайте файлы из Памяти: <code>[имя]</code> или "
+            "<code>[имя@v2]</code>"
+        ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="platform_menu")],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data="platform_menu")],
         ]),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer()
+    await callback.answer("Введите задачу")
 
 
 # ── Legacy command shortcuts (kept for keyboard convenience) ─────
@@ -901,11 +915,90 @@ async def platform_handle_message(message: Message) -> bool:
         elif instrument == "file_search":
             await _handle_rag_chat(message)
         else:
-            # "chat" — same RAG path with context ref support
-            await _handle_rag_chat(message)
+            # "chat" = pure LLM with history, NO RAG lookup.
+            # [filename] refs still work (pulled from Memory).
+            await _handle_pure_chat(message)
         return True
 
     return False
+
+
+# ── FR-28: pure chat instrument (no RAG, just LLM + history) ────
+
+async def _handle_pure_chat(message: Message) -> None:
+    """Chat instrument — pure conversational LLM with dialog history.
+
+    Does NOT search RAG/Qdrant. Does NOT require active domains.
+    [filename] refs are still resolved and injected as full context.
+    """
+    tg_id = message.from_user.id
+    user = platform_svc.get_user(tg_id)
+    question = message.text or ""
+    platform_svc.add_chat_message(tg_id, "user", question)
+
+    # FR-4: resolve [filename] / [file@v2] refs and pull full content
+    explicit_refs = context_resolver.parse_context_refs(question)
+    explicit_context_block = ""
+    if explicit_refs:
+        resolved_ids: list[str] = []
+        for ref in explicit_refs:
+            res = context_resolver.resolve_context_ref(tg_id, ref.name)
+            if res.matched is not None:
+                eid = (
+                    getattr(res.matched, "doc_id", None)
+                    or getattr(res.matched, "memory_object_id", None)
+                )
+                if eid:
+                    resolved_ids.append(eid)
+        if resolved_ids:
+            bundle = context_resolver.assemble_full_context(tg_id, resolved_ids)
+            chunks: list[str] = []
+            for obj in bundle.objects:
+                if not obj.content:
+                    continue
+                marker = "[СВОД]" if obj.used_summarization else "[ПОЛНЫЙ ФАЙЛ]"
+                chunks.append(f"{marker} {obj.filename}\n{obj.content}")
+            if chunks:
+                explicit_context_block = "\n\n---\n\n".join(chunks)
+
+    messages = [{
+        "role": "system",
+        "content": (
+            "Ты — ИИ-помощник. Отвечай кратко и по делу. "
+            "Если пользователь подключил файл через [имя] — секция "
+            "[ПОЛНЫЙ ФАЙЛ] или [СВОД] содержит его содержимое, используй "
+            "его как основной источник. "
+            "Никогда не ставь маркеры [1], [2]. "
+            "Если контекста нет — просто общайся."
+        ),
+    }]
+    messages.extend(user.chat_history[-10:-1])
+
+    user_content = question
+    if explicit_context_block:
+        user_content = f"Контекст:\n{explicit_context_block}\n\nВопрос: {question}"
+
+    messages.append({"role": "user", "content": user_content})
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=config.LLM_API_KEY, base_url=config.LLM_BASE_URL)
+        resp = await client.chat.completions.create(
+            model=user.model_id, messages=messages, temperature=0.3,
+        )
+        answer = resp.choices[0].message.content or "(пусто)"
+    except Exception as exc:  # noqa: BLE001
+        await message.answer(f"❌ Ошибка LLM: {exc}")
+        return
+
+    platform_svc.add_chat_message(tg_id, "assistant", answer)
+    answer_html = _render_answer_with_hyperlinks(answer)
+    await message.answer(
+        f"💬 <b>{_html.escape(_model_label(user.model_id))}</b>\n\n{answer_html}",
+        reply_markup=platform_answer_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 # ── FR-28: web_search instrument handler ─────────────────────────
