@@ -626,8 +626,8 @@ async def on_ftree_mkdir(callback: CallbackQuery):
     sent = await callback.message.bot.send_message(
         chat_id=callback.message.chat.id,
         text=(
-            f"📁 <b>Новая папка в {_breadcrumb(parent_path)}</b>\n\n"
-            "Отправьте название одним сообщением."
+            f"📁 <b>{_breadcrumb(parent_path)}</b>\n\n"
+            "Введите название:"
         ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"ftree:{parent_path}")],
@@ -1117,14 +1117,8 @@ async def platform_handle_message(message: Message) -> bool:
             return True
         _set_wait(tg_id, "platform")
         _set_tree_path(tg_id, parent_path)
-        # Show confirmation + re-render the parent folder
-        sent = await message.answer(
-            f"✅ Папка <b>{_html.escape(name)}</b> создана",
-            parse_mode=ParseMode.HTML,
-        )
-        _track_msg(tg_id, sent.message_id)
-        # Re-show the parent folder so user sees the new subfolder
-        await _show_folder(sent, tg_id, parent_path, page=0)
+        # Just re-show the folder — user sees the new subfolder appear
+        await _show_folder(message, tg_id, parent_path, page=0)
         return True
 
     # 0c. СУПЕРАГЕНТ plan refinement — user can send text to refine
