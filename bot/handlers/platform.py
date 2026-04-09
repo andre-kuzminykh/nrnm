@@ -1431,9 +1431,6 @@ async def _handle_task_goal(message: Message) -> None:
             )
         else:
             full_goal = new_text
-        for i, ref in enumerate(_PLAN_HISTORY[tg_id], 1):
-            parts.append(f"Уточнение {i}: {ref}")
-        full_goal = "\n".join(parts)
 
     status = await message.answer("🧠 <i>Строю план…</i>", parse_mode=ParseMode.HTML)
     _track_msg(tg_id, status.message_id)
