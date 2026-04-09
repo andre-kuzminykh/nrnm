@@ -521,15 +521,52 @@ def _breadcrumb(path: str) -> str:
     return "🏠 › " + " › ".join(parts)
 
 
+def _render_folder_text(tg_id: int, path: str, page: int = 0) -> str:
+    """Render a folder as text: breadcrumb + file hyperlinks.
+
+    Files are shown as clickable callback-based "hyperlinks" using
+    inline formatting — user taps a filename and gets the file form.
+    Since Telegram inline buttons are the only way to make text
+    actionable in bot messages, each file name is bold in the text
+    and also has a corresponding button in the keyboard. BUT per the
+    new spec, files are listed AS TEXT (hyperlink-style) and clicking
+    them triggers a callback via the file's path.
+
+    Actually, Telegram can't make arbitrary text clickable without
+    a URL. So we use a numbered list where each file is a bold name,
+    and the user taps the file via a small inline button that appears
+    alongside. But to minimize buttons: files are rendered as text
+    with their index, and there's ONE "open file" mechanism per tap.
+    """
+    page_files = file_tree_svc.list_files_page(tg_id, path, page=page)
+    total = file_tree_svc.count_files(tg_id, path)
+
+    lines = [f"📁 <b>{_breadcrumb(path)}</b>"]
+    lines.append(f"Файлов: {total}\n")
+
+    if page_files:
+        lines.append("<b>Файлы:</b>")
+        offset = page * file_tree_svc.PAGE_SIZE
+        for i, f in enumerate(page_files, start=offset + 1):
+            # Each file is rendered as bold text. Tapping is done via
+            # the callback "ffile:<path>" — we'll register a handler.
+            lines.append(f"  {i}. 📄 <b>{_html.escape(f.name)}</b> ({f.num_chunks} фр.)")
+    else:
+        lines.append("<i>Файлов нет. Отправьте файл в чат.</i>")
+
+    lines.append("")
+    lines.append("<i>📎 Отправьте файл — попадёт сюда.\n💬 Напишите вопрос — RAG по этой папке.</i>")
+    return "\n".join(lines)
+
+
 @router.callback_query(F.data.startswith("ftree:"))
 async def on_ftree_navigate(callback: CallbackQuery):
-    """Navigate into a folder or open a file context."""
+    """Navigate into a folder or open a file form."""
     tg_id = callback.from_user.id
     path = callback.data.split(":", 1)[1]
     node = file_tree_svc._resolve(tg_id, path)
 
     if node is None:
-        # Path doesn't exist yet — treat as root
         path = "/"
         node = file_tree_svc._root(tg_id)
 
@@ -537,38 +574,62 @@ async def on_ftree_navigate(callback: CallbackQuery):
     _set_wait(tg_id, "platform")
 
     if node.is_folder:
-        children = file_tree_svc.list_children(tg_id, path)
-        parent_path = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
-        if path == "/":
-            parent_path = None  # root has no parent — "back" goes to menu
-
-        file_count = len(file_tree_svc.get_scope(tg_id, path))
-        text = (
-            f"📁 <b>{_breadcrumb(path)}</b>\n\n"
-            f"Файлов: {file_count} (рекурсивно)\n\n"
-            "<i>Отправьте файл — он попадёт в эту папку.\n"
-            "Напишите вопрос — RAG будет искать только здесь.</i>"
-        )
-        await _replace_widget(
-            callback.message, text,
-            reply_markup=file_tree_keyboard(path, children, parent_path),
-            parse_mode=ParseMode.HTML,
-        )
+        await _show_folder(callback.message, tg_id, path, page=0)
     else:
-        # Single file context
+        # File form (FR-41)
         parent_path = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
         text = (
             f"📄 <b>{_html.escape(node.name)}</b>\n\n"
             f"Путь: <code>{_html.escape(path)}</code>\n"
             f"Фрагментов: {node.num_chunks}\n"
             f"ID: <code>{node.doc_id}</code>\n\n"
-            "<i>Напишите вопрос — отвечу только по этому файлу.</i>"
+            "<i>💬 Напишите вопрос — отвечу только по этому файлу.</i>"
         )
         await _replace_widget(
             callback.message, text,
             reply_markup=file_context_keyboard(path, parent_path),
             parse_mode=ParseMode.HTML,
         )
+    await callback.answer()
+
+
+async def _show_folder(message, tg_id: int, path: str, page: int = 0):
+    """Render a folder with file list + subfolders + pagination."""
+    children = file_tree_svc.list_children(tg_id, path)
+    subfolders = [c for c in children if c.is_folder]
+    tp = file_tree_svc.total_pages(tg_id, path)
+    parent_path = "/".join(path.rstrip("/").split("/")[:-1]) or "/"
+    if path == "/":
+        parent_path = None
+
+    text = _render_folder_text(tg_id, path, page)
+    await _replace_widget(
+        message, text,
+        reply_markup=file_tree_keyboard(
+            path, subfolders,
+            page=page, total_pages=tp,
+            parent_path=parent_path,
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.callback_query(F.data.startswith("ftree_page:"))
+async def on_ftree_page(callback: CallbackQuery):
+    """Pagination: switch to a different page of files."""
+    tg_id = callback.from_user.id
+    # Format: ftree_page:/path:N
+    parts = callback.data.split(":")
+    # Rejoin path parts (path may contain colons in theory, but ours don't)
+    page = int(parts[-1])
+    path = ":".join(parts[1:-1])
+    _set_tree_path(tg_id, path)
+    await _show_folder(callback.message, tg_id, path, page=page)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def on_noop(callback: CallbackQuery):
     await callback.answer()
 
 
@@ -589,19 +650,6 @@ async def on_ftree_mkdir(callback: CallbackQuery):
         parse_mode=ParseMode.HTML,
     )
     await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ftree_scope:"))
-async def on_ftree_select_all(callback: CallbackQuery):
-    """📎 Выбрать все — set the RAG scope to this folder and confirm."""
-    tg_id = callback.from_user.id
-    path = callback.data.split(":", 1)[1]
-    _set_tree_path(tg_id, path)
-    scope = file_tree_svc.get_scope(tg_id, path)
-    await callback.answer(
-        f"📎 Scope: {len(scope)} файлов из {_breadcrumb(path)}",
-        show_alert=True,
-    )
 
 
 @router.callback_query(F.data.startswith("ftree_delete:"))

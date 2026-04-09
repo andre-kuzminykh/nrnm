@@ -4,11 +4,11 @@
 Feature: Telegram AI Platform v2
 Requirements: FR-39, FR-40, FR-41, FR-42, FR-43
 
-FR-39 — tree structure: folders of arbitrary depth + files at any level
-FR-40 — RAG scoping: root = all files, folder = recursive, file = single
-FR-41 — in-context chat at any tree level
-FR-42 — "select all" at any folder level
-FR-43 — create subfolder + upload file into current folder
+FR-39 — tree structure: folders + files as hyperlinks in text
+FR-40 — scoped RAG: root = all, folder = recursive, file = single
+FR-41 — file form: card + in-context chat + delete + back
+FR-42 — pagination when >PAGE_SIZE files
+FR-43 — create subfolder + upload + source hyperlinks in answers
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ import pytest
 
 def _tree():
     try:
-        from services import file_tree  # noqa: WPS433
+        from services import file_tree
         return file_tree
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -134,26 +134,41 @@ def test_fr_40_single_file_scope(platform_svc, tg_id):
 
 
 # ─────────────────────────────────────────────────────────────────
-# FR-42 — select all
+# FR-42 — pagination
 # ─────────────────────────────────────────────────────────────────
 
-def test_fr_42_select_all_returns_recursive_file_list(platform_svc, tg_id):
+def test_fr_42_pagination_available_when_many_files(platform_svc, tg_id):
     ft = _tree()
     if ft is None:
         pytest.skip("TODO FR-42: file_tree not implemented")
-    ft.create_folder(tg_id, parent_path="/", name="all")
-    ft.create_folder(tg_id, parent_path="/all", name="nested")
-    ft.add_file(tg_id, folder_path="/all", filename="a.txt",
-                doc_id="d1", num_chunks=1)
-    ft.add_file(tg_id, folder_path="/all/nested", filename="b.txt",
-                doc_id="d2", num_chunks=1)
-    # select_all is the same as get_scope — it's the same concept
-    scope = ft.get_scope(tg_id, "/all")
-    assert len(scope) == 2
+    ft.create_folder(tg_id, parent_path="/", name="big")
+    for i in range(15):
+        ft.add_file(tg_id, folder_path="/big", filename=f"file_{i}.txt",
+                    doc_id=f"d{i}", num_chunks=1)
+    total = ft.count_files(tg_id, "/big")
+    assert total == 15
+    page = ft.list_files_page(tg_id, "/big", page=0, page_size=10)
+    assert len(page) == 10
+    page2 = ft.list_files_page(tg_id, "/big", page=1, page_size=10)
+    assert len(page2) == 5
+
+
+def test_fr_42_no_pagination_when_few_files(platform_svc, tg_id):
+    ft = _tree()
+    if ft is None:
+        pytest.skip("TODO FR-42: file_tree not implemented")
+    ft.create_folder(tg_id, parent_path="/", name="small")
+    for i in range(5):
+        ft.add_file(tg_id, folder_path="/small", filename=f"f{i}.txt",
+                    doc_id=f"d{i}", num_chunks=1)
+    total = ft.count_files(tg_id, "/small")
+    assert total == 5
+    page = ft.list_files_page(tg_id, "/small", page=0, page_size=10)
+    assert len(page) == 5
 
 
 # ─────────────────────────────────────────────────────────────────
-# FR-43 — create subfolder + upload into current folder
+# FR-43 — file lands in current folder + source hyperlinks
 # ─────────────────────────────────────────────────────────────────
 
 def test_fr_43_file_lands_in_current_folder(platform_svc, tg_id):

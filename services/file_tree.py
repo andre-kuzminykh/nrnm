@@ -191,3 +191,35 @@ def get_scope_doc_ids(tg_id: int, path: str) -> list[str]:
     """Convenience: just the doc_ids from get_scope. Used by the RAG
     query layer to filter Qdrant searches to the right collections."""
     return [f.doc_id for f in get_scope(tg_id, path)]
+
+
+# ── FR-42: pagination ────────────────────────────────────────────
+
+PAGE_SIZE = 10
+
+
+def count_files(tg_id: int, path: str) -> int:
+    """Count all files (not folders) recursively under `path`."""
+    return len(get_scope(tg_id, path))
+
+
+def list_files_page(
+    tg_id: int,
+    path: str,
+    page: int = 0,
+    page_size: int = PAGE_SIZE,
+) -> list[TreeNode]:
+    """Return a page of files inside `path` (recursive, sorted by name).
+
+    FR-42: when total > page_size, the UI shows ← → buttons.
+    When total <= page_size, no pagination buttons needed.
+    """
+    all_files = get_scope(tg_id, path)
+    all_files.sort(key=lambda f: f.name.lower())
+    start = page * page_size
+    return all_files[start : start + page_size]
+
+
+def total_pages(tg_id: int, path: str, page_size: int = PAGE_SIZE) -> int:
+    total = count_files(tg_id, path)
+    return max(1, (total + page_size - 1) // page_size)

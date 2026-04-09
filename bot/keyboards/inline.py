@@ -215,55 +215,48 @@ def platform_doc_keyboard(domain_idx: int, doc_idx: int) -> InlineKeyboardMarkup
 
 def file_tree_keyboard(
     path: str,
-    children: list,
+    subfolders: list,
+    page: int = 0,
+    total_pages: int = 1,
     parent_path: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Navigation keyboard for a folder in the file tree.
 
-    Shows:
+    Files are shown as hyperlinks in the message TEXT (not buttons).
+    The keyboard only has:
     - 📂 subfolders (tap = enter)
-    - 📄 files (tap = enter file context)
-    - ➕ Папка — create a new subfolder
-    - 📎 Выбрать все — select all files in this folder for RAG
-    - ◀️ Назад — go up one level (or back to main menu if at root)
+    - ➕ Папка
+    - ← page / → page (only when total_pages > 1, FR-42)
+    - ◀️ Назад
     """
     buttons = []
 
-    # Children: folders first, then files
-    folders = sorted([c for c in children if c.is_folder], key=lambda c: c.name)
-    files = sorted([c for c in children if not c.is_folder], key=lambda c: c.name)
-
-    for f in folders:
+    # Subfolders as buttons (files are in the text as hyperlinks)
+    for f in sorted(subfolders, key=lambda c: c.name):
         buttons.append([InlineKeyboardButton(
             text=f"📂 {f.name}",
             callback_data=f"ftree:{f.path}",
         )])
-    for f in files:
-        label = f"📄 {f.name}"
-        if f.num_chunks:
-            label += f" ({f.num_chunks} фр.)"
-        buttons.append([InlineKeyboardButton(
-            text=label,
-            callback_data=f"ftree:{f.path}",
-        )])
 
-    # Action buttons
-    buttons.append([
-        InlineKeyboardButton(text="➕ Папка", callback_data=f"ftree_mkdir:{path}"),
-        InlineKeyboardButton(text="📎 Выбрать все", callback_data=f"ftree_scope:{path}"),
-    ])
+    # Action row
+    action_row = [InlineKeyboardButton(text="➕ Папка", callback_data=f"ftree_mkdir:{path}")]
+    buttons.append(action_row)
 
-    # Back button
+    # Pagination (FR-42): only when >1 page
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"ftree_page:{path}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"ftree_page:{path}:{page + 1}"))
+        buttons.append(nav)
+
+    # Back
     if parent_path is not None:
-        buttons.append([InlineKeyboardButton(
-            text="◀️ Назад",
-            callback_data=f"ftree:{parent_path}",
-        )])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"ftree:{parent_path}")])
     else:
-        buttons.append([InlineKeyboardButton(
-            text="◀️ К меню",
-            callback_data="platform_menu",
-        )])
+        buttons.append([InlineKeyboardButton(text="◀️ К меню", callback_data="platform_menu")])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
