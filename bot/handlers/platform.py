@@ -1974,6 +1974,22 @@ def _extract_synthesis_text(run) -> str | None:
     return None
 
 
+def _safe_html(text: str) -> str:
+    """Validate that text is parseable Telegram HTML. If not, strip all
+    tags and return plain escaped text. Prevents 'Unclosed start tag'
+    crashes from LLM-generated content with broken URLs."""
+    import re
+    # Quick check: count open vs close tags
+    opens = len(re.findall(r"<[a-z]", text))
+    closes = len(re.findall(r"</[a-z]", text))
+    self_close = len(re.findall(r"/>", text))
+    if opens != closes + self_close:
+        # Broken HTML — strip all tags, return plain text
+        plain = re.sub(r"<[^>]+>", "", text)
+        return plain
+    return text
+
+
 def _md_to_html(text: str) -> str:
     """Convert LLM markdown output to Telegram HTML.
 
@@ -2023,12 +2039,11 @@ def _md_to_html(text: str) -> str:
         esc = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", esc)
         # [N] inline citation → bold
         esc = re.sub(r"\[(\d+)\]", r"<b>[\1]</b>", esc)
-        # Bare URLs → <a href>
-        esc = re.sub(
-            r"(https?://[^\s<&]+(?:&amp;[^\s<&]+)*)",
-            r'<a href="\1">\1</a>',
-            esc,
-        )
+        # Bare URLs → <a href> (careful with trailing punctuation)
+        def _linkify(m):
+            url = m.group(1).rstrip(".,;:!?)")
+            return f'<a href="{url}">{url}</a>'
+        esc = re.sub(r"(https?://[^\s<\"&]+)", _linkify, esc)
         out.append(esc)
     return "\n".join(out)
 
@@ -2148,6 +2163,7 @@ async def on_task_approve(callback: CallbackQuery):
         platform_svc.add_chat_message(tg_id, "assistant", synthesis[:2000])
     if len(final_text) > 4000:
         final_text = final_text[:4000]
+    final_text = _safe_html(final_text)
     try:
         await status.edit_text(
             final_text,
@@ -2155,11 +2171,18 @@ async def on_task_approve(callback: CallbackQuery):
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except TelegramBadRequest as e:
-        logger.warning("final edit failed: %s", e)
-        await callback.message.answer(
-            final_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-        )
+    except TelegramBadRequest:
+        # HTML still broken after sanitize — send as plain text
+        import re
+        plain = re.sub(r"<[^>]+>", "", final_text)
+        try:
+            await status.edit_text(
+                plain[:4000],
+                reply_markup=platform_answer_keyboard(),
+                disable_web_page_preview=True,
+            )
+        except Exception:  # noqa: BLE001
+            await callback.message.answer(plain[:4000])
 
 
 @router.callback_query(F.data.startswith("task_reapprove:"))
